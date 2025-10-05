@@ -1,0 +1,85 @@
+pipeline {
+  agent any
+
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+  }
+
+  parameters {
+    string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Git branch to build (e.g. main or test/scanner-check)')
+  }
+
+  tools {
+    maven 'Maven3'
+    jdk 'JDK17'
+  }
+
+  environment {
+    SONAR_TOKEN_ID = 'SONAR_TOKEN'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        deleteDir()
+        script {
+          def requested = params.GIT_BRANCH ?: 'main'
+          def trimmed   = requested.trim()
+          def repoUrl   = 'https://github.com/valletivarish/naveen_project.git'
+
+          echo "Requested branch (raw): '${requested}'"
+          echo "Using branch (trimmed): '${trimmed}'"
+
+          int exists = sh(returnStatus: true, script: "git ls-remote --exit-code --heads ${repoUrl} ${trimmed} >/dev/null 2>&1")
+          def branchToBuild = (exists == 0) ? trimmed : 'main'
+          if (exists != 0) {
+            echo "Branch '${trimmed}' not found in remote. Falling back to 'main'."
+          }
+
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: "*/${branchToBuild}"]],
+            userRemoteConfigs: [[
+              url: repoUrl,
+              credentialsId: 'github-username-pat'
+            ]]
+          ])
+        }
+      }
+    }
+
+    stage('Build with Maven') {
+      steps {
+        sh 'mvn -B -DskipTests -Dcheckstyle.skip=true clean package'
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        withCredentials([string(credentialsId: env.SONAR_TOKEN_ID, variable: 'SONAR_TOKEN')]) {
+          sh '''
+            set -e
+            probe(){ url="$1"; [ -z "$url" ] && return 1; curl -sSf --max-time 3 "$url/api/system/status" >/dev/null 2>&1; }
+            GATEWAY_IP="$(ip route | awk '/default/ {print $3; exit}')" || true
+            FIRST_IPV4="$(ip -4 addr show scope global 2>/dev/null | awk "/inet /{print \\$2}" | cut -d/ -f1 | head -n1)" || true
+            HOST_IP_ALT="$(hostname -I 2>/dev/null | awk "{print \\$1}")" || true
+            CANDS="${SONAR_HOST_URL:-} http://localhost:9000 http://127.0.0.1:9000 http://${GATEWAY_IP}:9000 http://host.docker.internal:9000 http://${FIRST_IPV4}:9000 http://${HOST_IP_ALT}:9000"
+            for u in $CANDS; do if probe "$u"; then SURL="$u"; break; fi; done
+            if [ -z "$SURL" ]; then echo "WARN: no reachable SonarQube; skipping analysis."; exit 0; fi
+            mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+              -DskipTests -Dcheckstyle.skip=true \
+              -Dsonar.projectKey=petclinic -Dsonar.projectName="petclinic" \
+              -Dsonar.host.url="$SURL" -Dsonar.token="$SONAR_TOKEN"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished with status: ${currentBuild.currentResult}"
+    }
+  }
+}

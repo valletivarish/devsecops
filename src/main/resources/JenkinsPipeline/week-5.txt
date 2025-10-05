@@ -1,0 +1,174 @@
+pipeline {
+  agent any
+
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+  }
+
+  parameters {
+    string(name: 'GIT_BRANCH', defaultValue: 'main',
+           description: 'Git branch to build (e.g. main or test/scanner-check)')
+  }
+
+  tools {
+    maven 'Maven3'
+    jdk   'JDK17'
+  }
+
+  environment {
+    SONAR_TOKEN_ID   = 'SONAR_TOKEN'
+    NVD_API_CRED_ID  = 'NVD_API_key'
+    ODC_TOOL_NAME    = 'OWASP DC'
+    DC_REPORT_DIR    = 'dependency-check-reports'
+    DC_PROJECT_NAME  = 'petclinic'
+    DC_CACHE_DIR     = '/var/jenkins_home/dependency-check-data'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        deleteDir()
+        script {
+          def requested = params.GIT_BRANCH ?: 'main'
+          def trimmed   = requested.trim()
+          def repoUrl   = 'https://github.com/valletivarish/devsecops.git'
+          echo "Requested branch: '${requested}'"
+          echo "Using branch: '${trimmed}'"
+          int exists = sh(returnStatus: true, script: "git ls-remote --exit-code --heads ${repoUrl} ${trimmed} >/dev/null 2>&1")
+          def branchToBuild = (exists == 0) ? trimmed : 'main'
+          if (exists != 0) echo "Branch '${trimmed}' not found; falling back to 'main'."
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: "*/${branchToBuild}"]],
+            userRemoteConfigs: [[url: repoUrl, credentialsId: 'github-username-pat']]
+          ])
+        }
+      }
+    }
+
+    stage('Build with Maven') {
+      steps {
+        sh 'mvn -B -DskipTests -Dcheckstyle.skip=true clean package'
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        withCredentials([string(credentialsId: env.SONAR_TOKEN_ID, variable: 'SONAR_TOKEN')]) {
+          sh '''
+            set -e
+            probe(){ url="$1"; [ -z "$url" ] && return 1; curl -sSf --max-time 3 "$url/api/system/status" >/dev/null 2>&1; }
+            GATEWAY_IP="$(ip route | awk '/default/ {print $3; exit}')" || true
+            FIRST_IPV4="$(ip -4 addr show scope global 2>/dev/null | awk "/inet /{print \\$2}" | cut -d/ -f1 | head -n1)" || true
+            HOST_IP_ALT="$(hostname -I 2>/dev/null | awk "{print \\$1}")" || true
+            CANDS="${SONAR_HOST_URL:-} http://localhost:9000 http://127.0.0.1:9000 http://${GATEWAY_IP}:9000 http://host.docker.internal:9000 http://${FIRST_IPV4}:9000 http://${HOST_IP_ALT}:9000"
+            for u in $CANDS; do if probe "$u"; then SURL="$u"; break; fi; done
+            if [ -z "$SURL" ]; then echo "WARN: no reachable SonarQube; skipping analysis."; exit 0; fi
+            mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+              -DskipTests -Dcheckstyle.skip=true \
+              -Dsonar.projectKey=petclinic -Dsonar.projectName="petclinic" \
+              -Dsonar.host.url="$SURL" -Dsonar.token="$SONAR_TOKEN"
+          '''
+        }
+      }
+    }
+
+    stage('OWASP Dependency-Check') {
+      steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+          withCredentials([string(credentialsId: env.NVD_API_CRED_ID, variable: 'NVD_API_KEY')]) {
+            script {
+              def mavenStatus = sh(returnStatus: true, script: "mvn -v >/dev/null 2>&1")
+              if (mavenStatus == 0) {
+                echo "Running OWASP Dependency-Check via Maven..."
+                sh '''
+                  set -e
+                  mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"
+                  mvn -B org.owasp:dependency-check-maven:check \
+                    -Dformat=ALL \
+                    -DskipTests \
+                    -DfailOnError=false \
+                    -Dnvd.api.key="${NVD_API_KEY}" \
+                    -Ddata.validForHours=240 \
+                    -Ddata.directory="${DC_CACHE_DIR}" \
+                    -DlogFile=target/dependency-check.log || true
+
+                  cp -f target/dependency-check-report.* "${DC_REPORT_DIR}/" 2>/dev/null || true
+                  cp -f target/dependency-check.log "${DC_REPORT_DIR}/" 2>/dev/null || true
+                '''
+              } else {
+                echo "Running OWASP Dependency-Check via Jenkins Plugin..."
+                dependencyCheck(
+                  odcInstallation: env.ODC_TOOL_NAME,
+                  additionalArguments: """
+                    --project "${DC_PROJECT_NAME}"
+                    --scan "${WORKSPACE}"
+                    --out "${WORKSPACE}/${DC_REPORT_DIR}"
+                    -f XML -f HTML -f JSON
+                    --nvdApiKey "${NVD_API_KEY}"
+                    --disableAssembly
+                    --failOnCVSS 11
+                    --data "${DC_CACHE_DIR}"
+                    --log "${WORKSPACE}/${DC_REPORT_DIR}/dependency-check.log"
+                  """.trim(),
+                  stopBuild: false
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Publish OWASP Report') {
+      steps {
+        dependencyCheckPublisher(
+          pattern: "${env.DC_REPORT_DIR}/dependency-check-report.xml",
+          stopBuild: false,
+          skipNoReportFiles: true
+        )
+        archiveArtifacts artifacts: "${env.DC_REPORT_DIR}/**", fingerprint: true, allowEmptyArchive: true
+
+        sh '''
+          set -e
+          R="${DC_REPORT_DIR}"
+          JSON="${R}/dependency-check-report.json"
+          SUM="${R}/SUMMARY.txt"
+          mkdir -p "$R"; : > "$SUM"
+          echo "OWASP Dependency-Check Summary for ${DC_PROJECT_NAME}" >> "$SUM"
+          echo "Generated: $(date -u +%FT%TZ)" >> "$SUM"
+          echo "" >> "$SUM"
+          if [ -f "$JSON" ]; then
+            if command -v jq >/dev/null 2>&1; then
+              jq -r '
+                def sev: .vulnerabilities[].severity // empty;
+                [sev|ascii_downcase] | group_by(.) | map({(.[0]): length}) | add
+              ' "$JSON" 2>/dev/null | sed 's/[{}"]//g; s/: /= /g' >> "$SUM" || true
+            else
+              for s in CRITICAL HIGH MEDIUM LOW; do
+                c=$(grep -o "\"severity\"\\s*:\\s*\"$s\"" "$JSON" | wc -l | tr -d ' ')
+                printf "%s = %s\n" "$s" "$c" >> "$SUM"
+              done
+            fi
+            echo "" >> "$SUM"
+            echo "Reports:" >> "$SUM"
+            [ -f "${R}/dependency-check-report.html" ] && echo "• HTML: ${R}/dependency-check-report.html" >> "$SUM"
+            echo "• XML:  ${R}/dependency-check-report.xml" >> "$SUM"
+            echo "• JSON: ${R}/dependency-check-report.json" >> "$SUM"
+          else
+            echo "No Dependency-Check reports found." >> "$SUM"
+          fi
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished with status: ${currentBuild.currentResult}"
+      echo "OWASP reports in: ${env.DC_REPORT_DIR}/"
+      echo "Summary file: ${env.DC_REPORT_DIR}/SUMMARY.txt"
+    }
+  }
+}
