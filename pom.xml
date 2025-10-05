@@ -92,38 +92,6 @@
 					</excludes>
 				</configuration>
 			</plugin>
-
-			<!-- OWASP Dependency-Check -->
-			<plugin>
-				<groupId>org.owasp</groupId>
-				<artifactId>dependency-check-maven</artifactId>
-				<version>${dependency-check.version}</version>
-				<configuration>
-					<!-- Report formats -->
-					<formats>HTML,JSON,XML</formats>
-					<!-- Cache directory (reused across builds) -->
-					<dataDirectory>
-						${project.build.directory}/dependency-check-data</dataDirectory>
-					<!-- Don’t fail build on errors -->
-					<failOnError>false</failOnError>
-					<!-- Don’t break build on CVEs -->
-					<failBuildOnCVSS>11</failBuildOnCVSS>
-					<!-- NVD API key (from Jenkins env) -->
-					<nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
-					<!-- Pretty JSON -->
-					<prettyPrint>true</prettyPrint>
-					<!-- Always update DB if older than 4h -->
-					<cveValidForHours>240</cveValidForHours>
-				</configuration>
-				<executions>
-					<execution>
-						<goals>
-							<goal>check</goal>
-						</goals>
-					</execution>
-				</executions>
-			</plugin>
-
 			<!-- CycloneDX SBOM -->
 			<plugin>
 				<groupId>org.cyclonedx</groupId>
