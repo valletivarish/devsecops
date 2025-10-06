@@ -87,12 +87,12 @@ pipeline {
 
     stage('OWASP Dependency-Check') {
       steps {
-        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          withCredentials([string(credentialsId: env.NVD_API_CRED_ID, variable: 'NVD_API_KEY')]) {
-            script {
-              sh 'mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"'
-              echo "[OWASP] Cache='${env.DC_CACHE_DIR}' validFor=${env.DC_VALID_HOURS}h, Policy: FAIL_CRIT>=${env.DC_FAIL_CRITICAL}, UNSTABLE_HIGH>=${env.DC_UNSTABLE_HIGH}, UNSTABLE_MED>=${env.DC_UNSTABLE_MEDIUM}"
+        withCredentials([string(credentialsId: env.NVD_API_CRED_ID, variable: 'NVD_API_KEY')]) {
+          script {
+            sh 'mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"'
+            echo "[OWASP] Cache='${env.DC_CACHE_DIR}' validFor=${env.DC_VALID_HOURS}h, Policy: FAIL_CRIT>=${env.DC_FAIL_CRITICAL}, UNSTABLE_HIGH>=${env.DC_UNSTABLE_HIGH}, UNSTABLE_MED>=${env.DC_UNSTABLE_MEDIUM}"
 
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
               def mavenRunner = (sh(returnStatus: true, script: "mvn -v >/dev/null 2>&1") == 0)
               if (mavenRunner) {
                 echo "[OWASP] Runner: Maven plugin"
@@ -128,46 +128,42 @@ pipeline {
                   stopBuild: false
                 )
               }
+            }
 
-              sh '''
-                if [ -f "${DC_REPORT_DIR}/dependency-check.log" ]; then
-                  echo "[OWASP] Log: Data directory and update status"
-                  grep -E "Data directory|No NVD update required|Updating|Downloading NVD" "${DC_REPORT_DIR}/dependency-check.log" || true
-                else
-                  echo "[OWASP] Log missing"
-                fi
-              '''
+            sh '''
+              if [ -f "${DC_REPORT_DIR}/dependency-check.log" ]; then
+                grep -E "Data directory|No NVD update required|Updating|Downloading NVD" "${DC_REPORT_DIR}/dependency-check.log" || true
+              fi
+            '''
 
-              def jsonPath = "${env.DC_REPORT_DIR}/dependency-check-report.json"
-              if (!fileExists(jsonPath)) {
-                echo "[OWASP] JSON not found → thresholds skipped"
-                return
+            def jsonPath = "${env.DC_REPORT_DIR}/dependency-check-report.json"
+            if (!fileExists(jsonPath)) {
+              echo "[OWASP] JSON not found → skipping policy enforcement"
+              return
+            }
+
+            def report = readJSON file: jsonPath
+            def counts = [CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0]
+            (report.dependencies ?: []).each { d ->
+              (d.vulnerabilities ?: []).each { v ->
+                def s = (v.severity ?: '').toUpperCase()
+                if (counts.containsKey(s)) counts[s] = counts[s] + 1
               }
+            }
+            echo "[OWASP] Counts: CRIT=${counts.CRITICAL} HIGH=${counts.HIGH} MED=${counts.MEDIUM} LOW=${counts.LOW}"
 
-              def report = readJSON file: jsonPath
-              def counts = [CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0]
-              (report.dependencies ?: []).each { d ->
-                (d.vulnerabilities ?: []).each { v ->
-                  def s = (v.severity ?: '').toUpperCase()
-                  if (counts.containsKey(s)) counts[s] = counts[s] + 1
-                }
-              }
-              echo "[OWASP] Counts: CRIT=${counts.CRITICAL} HIGH=${counts.HIGH} MED=${counts.MEDIUM} LOW=${counts.LOW}"
+            int failCrit = env.DC_FAIL_CRITICAL.toInteger()
+            int warnHigh = env.DC_UNSTABLE_HIGH.toInteger()
+            int warnMed  = env.DC_UNSTABLE_MEDIUM.toInteger()
 
-              int failCrit = env.DC_FAIL_CRITICAL.toInteger()
-              int warnHigh = env.DC_UNSTABLE_HIGH.toInteger()
-              int warnMed  = env.DC_UNSTABLE_MEDIUM.toInteger()
-
-              if (counts.CRITICAL >= failCrit) {
-                echo "[OWASP] Result: FAIL (CRITICAL>=${failCrit})"
-                error("CRITICAL vulnerabilities found: ${counts.CRITICAL}")
-              }
-              if (counts.HIGH >= warnHigh || counts.MEDIUM >= warnMed) {
-                echo "[OWASP] Result: UNSTABLE (HIGH>=${warnHigh} or MEDIUM>=${warnMed})"
-                currentBuild.result = 'UNSTABLE'
-              } else {
-                echo "[OWASP] Result: SUCCESS (within policy)"
-              }
+            if (counts.CRITICAL >= failCrit) {
+              error("CRITICAL vulnerabilities found: ${counts.CRITICAL} (>= ${failCrit})")
+            }
+            if (counts.HIGH >= warnHigh || counts.MEDIUM >= warnMed) {
+              echo "[OWASP] Result: UNSTABLE (HIGH>=${warnHigh} or MEDIUM>=${warnMed})"
+              currentBuild.result = 'UNSTABLE'
+            } else {
+              echo "[OWASP] Result: SUCCESS (within policy)"
             }
           }
         }
