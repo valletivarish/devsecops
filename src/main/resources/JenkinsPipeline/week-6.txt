@@ -23,7 +23,7 @@ pipeline {
     DC_REPORT_DIR     = 'dependency-check-reports'
     DC_PROJECT_NAME   = 'petclinic'
     DC_CACHE_DIR      = '/var/jenkins_home/dependency-check-data'
-
+    DC_VALID_HOURS    = '4' 
     IAC_REPORT_DIR    = 'iac-reports'
     CHECKOV_VENV      = '/var/jenkins_home/.venvs/checkov'
     PIP_CACHE_DIR     = '/var/jenkins_home/.cache/pip'
@@ -96,15 +96,15 @@ pipeline {
                     -DskipTests \
                     -DfailOnError=false \
                     -Dnvd.api.key="${NVD_API_KEY}" \
-                    -Ddata.validForHours=240 \
-                    -Ddata.directory="${DC_CACHE_DIR}" \
+                    -DdataValidForHours=${DC_VALID_HOURS} \
+                    -DdataDirectory="${DC_CACHE_DIR}" \
                     -DlogFile=target/dependency-check.log || true
 
                   cp -f target/dependency-check-report.* "${DC_REPORT_DIR}/" 2>/dev/null || true
                   cp -f target/dependency-check.log "${DC_REPORT_DIR}/" 2>/dev/null || true
                 '''
               } else {
-                echo "Running OWASP Dependency-Check via Jenkins Plugin..."
+                echo "Running OWASP Dependency-Check via Jenkins Plugin (CLI)..."
                 dependencyCheck(
                   odcInstallation: env.ODC_TOOL_NAME,
                   additionalArguments: """
@@ -116,6 +116,7 @@ pipeline {
                     --disableAssembly
                     --failOnCVSS 11
                     --data "${DC_CACHE_DIR}"
+                    --cveValidForHours ${DC_VALID_HOURS}
                     --log "${WORKSPACE}/${DC_REPORT_DIR}/dependency-check.log"
                   """.trim(),
                   stopBuild: false
@@ -176,14 +177,8 @@ pipeline {
           set -e
           mkdir -p "${IAC_REPORT_DIR}" "${PIP_CACHE_DIR}" "$(dirname "${CHECKOV_VENV}")"
 
-          echo "====== FULL FILE LIST ======"
-          find "$WORKSPACE" -type f | sort || true
-          echo "============================"
-
-          # Helper to run a command with sudo if available, otherwise plain
           as_sudo() { if command -v sudo >/dev/null 2>&1; then sudo "$@"; else "$@"; fi; }
 
-          # Install Python if missing
           if ! command -v python3 >/dev/null 2>&1; then
             echo "python3 not found. Installing..."
             if command -v apt-get >/dev/null 2>&1; then
@@ -197,7 +192,6 @@ pipeline {
             fi
           fi
 
-          # Ensure the 'venv' module is available (Debian needs python3-venv)
           if ! python3 -c "import venv" >/dev/null 2>&1; then
             echo "python3-venv missing. Installing..."
             if command -v apt-get >/dev/null 2>&1; then
@@ -208,11 +202,10 @@ pipeline {
             fi
           fi
 
-          # Create the venv (retry once after ensuring packages)
           if [ ! -f "${CHECKOV_VENV}/bin/activate" ]; then
             echo "Creating virtualenv at ${CHECKOV_VENV}"
             python3 -m venv "${CHECKOV_VENV}" || {
-              echo "Venv creation failed. Trying to (re)install venv/pip and retry..."
+              echo "Venv creation failed. Retrying..."
               if command -v apt-get >/dev/null 2>&1; then
                 as_sudo apt-get update -y
                 as_sudo apt-get install -y python3-venv python3-pip
@@ -227,7 +220,6 @@ pipeline {
           python --version
           pip --version
 
-          # Upgrade pip and install checkov with a persistent cache
           pip install --upgrade pip
           pip install --cache-dir "${PIP_CACHE_DIR}" -U "checkov==${CHECKOV_VERSION}"
 
