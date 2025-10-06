@@ -8,9 +8,8 @@ pipeline {
 
   parameters {
     string(name: 'GIT_BRANCH', defaultValue: 'main',
-           description: 'Git branch to build (e.g. main or test/scanner-check)')
+           description: 'Git branch to build (e.g. main)')
   }
-
   tools {
     maven 'Maven3'
     jdk   'JDK17'
@@ -117,7 +116,7 @@ pipeline {
                     --project "${DC_PROJECT_NAME}"
                     --scan "${WORKSPACE}"
                     --out "${WORKSPACE}/${DC_REPORT_DIR}"
-                    -f XML -f HTML -f JSON
+                    -f ALL
                     --nvdApiKey "${NVD_API_KEY}"
                     --disableAssembly
                     --failOnCVSS 11
@@ -177,12 +176,11 @@ pipeline {
           stopBuild: false,
           skipNoReportFiles: true
         )
-        archiveArtifacts artifacts: "${env.DC_REPORT_DIR}/**", fingerprint: true, allowEmptyArchive: true
         sh '''
           set -e
           R="${DC_REPORT_DIR}"
           JSON="${R}/dependency-check-report.json"
-          SUM="${R}/SUMMARY.txt"
+          SUM="${R}/OWASP-Dependency-Check-Summary.txt"
           mkdir -p "$R"; : > "$SUM"
           echo "OWASP Dependency-Check Summary for ${DC_PROJECT_NAME}" >> "$SUM"
           echo "Generated: $(date -u +%FT%TZ)" >> "$SUM"
@@ -193,11 +191,17 @@ pipeline {
             done
             echo "Reports:" >> "$SUM"
             [ -f "${R}/dependency-check-report.html" ] && echo "HTML: ${R}/dependency-check-report.html" >> "$SUM"
-            echo "XML:  ${R}/dependency-check-report.xml" >> "$SUM"
-            echo "JSON: ${R}/dependency-check-report.json" >> "$SUM"
+            [ -f "${R}/dependency-check-report.json" ] && echo "JSON: ${R}/dependency-check-report.json" >> "$SUM"
           else
-            echo "No Dependency-Check reports found." >> "$SUM"
+            echo "No Dependency-Check JSON found." >> "$SUM"
           fi
+        '''
+        archiveArtifacts artifacts: "${env.DC_REPORT_DIR}/dependency-check-report.html, ${env.DC_REPORT_DIR}/dependency-check-report.json, ${env.DC_REPORT_DIR}/dependency-check.log, ${env.DC_REPORT_DIR}/OWASP-Dependency-Check-Summary.txt", fingerprint: true, allowEmptyArchive: true
+        sh '''
+          set -e
+          R="${DC_REPORT_DIR}"
+          rm -f "${R}/dependency-check-report.xml" \
+                "${R}/dependency-check-report.sarif" || true
         '''
       }
     }
@@ -246,7 +250,95 @@ pipeline {
           echo "Runner: pip (venv)" > "${IAC_REPORT_DIR}/runner.txt"
         '''
         junit allowEmptyResults: true, testResults: "${env.IAC_REPORT_DIR}/checkov-report.xml"
-        archiveArtifacts artifacts: "${env.IAC_REPORT_DIR}/**", fingerprint: true, allowEmptyArchive: true
+        archiveArtifacts artifacts: "${env.IAC_REPORT_DIR}/checkov-report.json", fingerprint: true, allowEmptyArchive: true
+        sh '''
+          set -e
+          rm -f "${IAC_REPORT_DIR}/checkov-report.xml" \
+                "${IAC_REPORT_DIR}/runner.txt" || true
+        '''
+      }
+    }
+
+    stage('Trivy FS Scan') {
+      steps {
+        script {
+          sh '''
+            set -e
+            mkdir -p trivy-reports
+            echo "[TRIVY] Starting filesystem scan..."
+
+            as_sudo() { if command -v sudo >/dev/null 2>&1; then sudo "$@"; else "$@"; fi; }
+            if ! command -v trivy >/dev/null 2>&1; then
+              echo "[TRIVY] Installing Trivy..."
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                | as_sudo sh -s -- -b /usr/local/bin
+            fi
+
+            echo "[TRIVY] Running scan (vuln, config, secret) → table.txt + json..."
+            trivy fs --scanners vuln,config,secret --ignore-unfixed --no-progress \
+              --format table -o trivy-reports/table.txt .
+
+            trivy fs --scanners vuln,config,secret --ignore-unfixed --no-progress \
+              --format json -o trivy-reports/trivy.json .
+
+            echo "[TRIVY] Calculating severity counts from table..."
+            CRIT=$(grep -w "CRITICAL" trivy-reports/table.txt | wc -l | tr -d ' ')
+            HIGH=$(grep -w "HIGH"     trivy-reports/table.txt | wc -l | tr -d ' ')
+            MED=$(grep -w "MEDIUM"    trivy-reports/table.txt | wc -l | tr -d ' ')
+            LOW=$(grep -w "LOW"       trivy-reports/table.txt | wc -l | tr -d ' ')
+            SECRETS=$(grep -i "secret" trivy-reports/table.txt | wc -l | tr -d ' ')
+
+            echo "[TRIVY] Counts → CRITICAL=$CRIT HIGH=$HIGH MEDIUM=$MED LOW=$LOW SECRETS=$SECRETS"
+            echo "[TRIVY] Building HTML report..."
+
+            cat > trivy-reports/trivy.html <<HTML
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trivy Filesystem Report</title>
+<style>
+  body{font-family:ui-monospace,monospace;margin:16px}
+  h1{font-size:20px;margin:0 0 12px}
+  .meta{color:#555;margin-bottom:10px}
+  .chips{display:flex;gap:8px;margin:8px 0 16px}
+  .chip{border:1px solid #e5e7eb;border-radius:999px;padding:6px 10px;background:#f8fafc}
+  .crit{border-color:#ef4444;background:#fef2f2}
+  .high{border-color:#f59e0b;background:#fff7ed}
+  .med{border-color:#22c55e;background:#f0fdf4}
+  .low{border-color:#60a5fa;background:#eff6ff}
+  .sec{border-color:#8b5cf6;background:#f5f3ff}
+  pre{white-space:pre-wrap;word-wrap:break-word;background:#f6f8fa;padding:12px;border-radius:8px;border:1px solid #e5e7eb}
+  .note{font-size:12px;color:#666;margin-top:8px}
+</style>
+</head><body>
+  <h1>Trivy Filesystem Scan</h1>
+  <div class="meta">Scanners: vuln, config, secret • Ignore unfixed: true</div>
+  <div class="chips">
+    <span class="chip crit">CRITICAL: ${CRIT}</span>
+    <span class="chip high">HIGH: ${HIGH}</span>
+    <span class="chip med">MEDIUM: ${MED}</span>
+    <span class="chip low">LOW: ${LOW}</span>
+    <span class="chip sec">Secrets: ${SECRETS}</span>
+  </div>
+  <pre>
+HTML
+            sed -e 's/\\x1b\\[[0-9;]*m//g' trivy-reports/table.txt >> trivy-reports/trivy.html || true
+            echo "</pre><div class='note'>JSON saved as <code>trivy-reports/trivy.json</code>.</div></body></html>" >> trivy-reports/trivy.html
+
+            echo "[TRIVY] Report generated: trivy-reports/trivy.html (and trivy-reports/trivy.json)"
+          '''
+
+          archiveArtifacts artifacts: 'trivy-reports/trivy.html,trivy-reports/trivy.json', fingerprint: true, allowEmptyArchive: true
+
+          publishHTML target: [
+            reportDir: 'trivy-reports',
+            reportFiles: 'trivy.html',
+            reportName: 'Trivy FS Report',
+            keepAll: true,
+            alwaysLinkToLastBuild: true,
+            allowMissing: true
+          ]
+        }
       }
     }
   }
