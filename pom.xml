@@ -55,7 +55,7 @@
 			<scope>test</scope>
 		</dependency>
 
-		Example vulnerable dependency (for OWASP to detect)
+		<!-- Example vulnerable dependency (for OWASP to detect) -->
 		<dependency>
 			<groupId>commons-collections</groupId>
 			<artifactId>commons-collections</artifactId>
