@@ -17,18 +17,23 @@ pipeline {
   }
 
   environment {
-    SONAR_TOKEN_ID    = 'SONAR_TOKEN'
-    NVD_API_CRED_ID   = 'NVD_API_key'
-    ODC_TOOL_NAME     = 'OWASP DC'
-    DC_REPORT_DIR     = 'dependency-check-reports'
-    DC_PROJECT_NAME   = 'petclinic'
-    DC_CACHE_DIR      = '/var/jenkins_home/dependency-check-data'
-    DC_VALID_HOURS    = '4' 
-    IAC_REPORT_DIR    = 'iac-reports'
-    CHECKOV_VENV      = '/var/jenkins_home/.venvs/checkov'
-    PIP_CACHE_DIR     = '/var/jenkins_home/.cache/pip'
-    CHECKOV_FRAMEWORKS = 'dockerfile,kubernetes,terraform'
-    CHECKOV_VERSION   = '3.2.473'
+    SONAR_TOKEN_ID       = 'SONAR_TOKEN'
+    NVD_API_CRED_ID      = 'NVD_API_key'
+    ODC_TOOL_NAME        = 'OWASP DC'
+
+    DC_REPORT_DIR        = 'dependency-check-reports'
+    DC_PROJECT_NAME      = 'petclinic'
+    DC_CACHE_DIR         = '/var/jenkins_home/dependency-check-data'
+    DC_VALID_HOURS       = '4'
+    DC_FAIL_CRITICAL     = '1'
+    DC_UNSTABLE_HIGH     = '2'
+    DC_UNSTABLE_MEDIUM   = '5'
+
+    IAC_REPORT_DIR       = 'iac-reports'
+    CHECKOV_VENV         = '/var/jenkins_home/.venvs/checkov'
+    PIP_CACHE_DIR        = '/var/jenkins_home/.cache/pip'
+    CHECKOV_FRAMEWORKS   = 'dockerfile,kubernetes,terraform'
+    CHECKOV_VERSION      = '3.2.473'
   }
 
   stages {
@@ -39,11 +44,10 @@ pipeline {
           def requested = params.GIT_BRANCH ?: 'main'
           def trimmed   = requested.trim()
           def repoUrl   = 'https://github.com/valletivarish/devsecops.git'
-          echo "Requested branch: '${requested}'"
-          echo "Using branch: '${trimmed}'"
+          echo "[SCM] Branch requested='${requested}', using='${trimmed}'"
           int exists = sh(returnStatus: true, script: "git ls-remote --exit-code --heads ${repoUrl} ${trimmed} >/dev/null 2>&1")
           def branchToBuild = (exists == 0) ? trimmed : 'main'
-          if (exists != 0) echo "Branch '${trimmed}' not found; falling back to 'main'."
+          if (exists != 0) echo "[SCM] '${trimmed}' not found → fallback to 'main'"
           checkout([
             $class: 'GitSCM',
             branches: [[name: "*/${branchToBuild}"]],
@@ -70,7 +74,8 @@ pipeline {
             HOST_IP_ALT="$(hostname -I 2>/dev/null | awk "{print \\$1}")" || true
             CANDS="${SONAR_HOST_URL:-} http://localhost:9000 http://127.0.0.1:9000 http://${GATEWAY_IP}:9000 http://host.docker.internal:9000 http://${FIRST_IPV4}:9000 http://${HOST_IP_ALT}:9000"
             for u in $CANDS; do if probe "$u"; then SURL="$u"; break; fi; done
-            if [ -z "$SURL" ]; then echo "WARN: no reachable SonarQube; skipping analysis."; exit 0; fi
+            if [ -z "$SURL" ]; then echo "[SONAR] Not reachable → skipping"; exit 0; fi
+            echo "[SONAR] Using: $SURL"
             mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
               -DskipTests -Dcheckstyle.skip=true \
               -Dsonar.projectKey=petclinic -Dsonar.projectName="petclinic" \
@@ -85,12 +90,14 @@ pipeline {
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
           withCredentials([string(credentialsId: env.NVD_API_CRED_ID, variable: 'NVD_API_KEY')]) {
             script {
-              def mavenStatus = sh(returnStatus: true, script: "mvn -v >/dev/null 2>&1")
-              if (mavenStatus == 0) {
-                echo "Running OWASP Dependency-Check via Maven..."
+              sh 'mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"'
+              echo "[OWASP] Cache='${env.DC_CACHE_DIR}' validFor=${env.DC_VALID_HOURS}h, Policy: FAIL_CRIT>=${env.DC_FAIL_CRITICAL}, UNSTABLE_HIGH>=${env.DC_UNSTABLE_HIGH}, UNSTABLE_MED>=${env.DC_UNSTABLE_MEDIUM}"
+
+              def mavenRunner = (sh(returnStatus: true, script: "mvn -v >/dev/null 2>&1") == 0)
+              if (mavenRunner) {
+                echo "[OWASP] Runner: Maven plugin"
                 sh '''
                   set -e
-                  mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"
                   mvn -B org.owasp:dependency-check-maven:check \
                     -Dformat=ALL \
                     -DskipTests \
@@ -99,12 +106,11 @@ pipeline {
                     -DdataValidForHours=${DC_VALID_HOURS} \
                     -DdataDirectory="${DC_CACHE_DIR}" \
                     -DlogFile=target/dependency-check.log || true
-
                   cp -f target/dependency-check-report.* "${DC_REPORT_DIR}/" 2>/dev/null || true
                   cp -f target/dependency-check.log "${DC_REPORT_DIR}/" 2>/dev/null || true
                 '''
               } else {
-                echo "Running OWASP Dependency-Check via Jenkins Plugin (CLI)..."
+                echo "[OWASP] Runner: Jenkins plugin CLI"
                 dependencyCheck(
                   odcInstallation: env.ODC_TOOL_NAME,
                   additionalArguments: """
@@ -122,6 +128,46 @@ pipeline {
                   stopBuild: false
                 )
               }
+
+              sh '''
+                if [ -f "${DC_REPORT_DIR}/dependency-check.log" ]; then
+                  echo "[OWASP] Log: Data directory and update status"
+                  grep -E "Data directory|No NVD update required|Updating|Downloading NVD" "${DC_REPORT_DIR}/dependency-check.log" || true
+                else
+                  echo "[OWASP] Log missing"
+                fi
+              '''
+
+              def jsonPath = "${env.DC_REPORT_DIR}/dependency-check-report.json"
+              if (!fileExists(jsonPath)) {
+                echo "[OWASP] JSON not found → thresholds skipped"
+                return
+              }
+
+              def report = readJSON file: jsonPath
+              def counts = [CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0]
+              (report.dependencies ?: []).each { d ->
+                (d.vulnerabilities ?: []).each { v ->
+                  def s = (v.severity ?: '').toUpperCase()
+                  if (counts.containsKey(s)) counts[s] = counts[s] + 1
+                }
+              }
+              echo "[OWASP] Counts: CRIT=${counts.CRITICAL} HIGH=${counts.HIGH} MED=${counts.MEDIUM} LOW=${counts.LOW}"
+
+              int failCrit = env.DC_FAIL_CRITICAL.toInteger()
+              int warnHigh = env.DC_UNSTABLE_HIGH.toInteger()
+              int warnMed  = env.DC_UNSTABLE_MEDIUM.toInteger()
+
+              if (counts.CRITICAL >= failCrit) {
+                echo "[OWASP] Result: FAIL (CRITICAL>=${failCrit})"
+                error("CRITICAL vulnerabilities found: ${counts.CRITICAL}")
+              }
+              if (counts.HIGH >= warnHigh || counts.MEDIUM >= warnMed) {
+                echo "[OWASP] Result: UNSTABLE (HIGH>=${warnHigh} or MEDIUM>=${warnMed})"
+                currentBuild.result = 'UNSTABLE'
+              } else {
+                echo "[OWASP] Result: SUCCESS (within policy)"
+              }
             }
           }
         }
@@ -136,7 +182,6 @@ pipeline {
           skipNoReportFiles: true
         )
         archiveArtifacts artifacts: "${env.DC_REPORT_DIR}/**", fingerprint: true, allowEmptyArchive: true
-
         sh '''
           set -e
           R="${DC_REPORT_DIR}"
@@ -145,24 +190,15 @@ pipeline {
           mkdir -p "$R"; : > "$SUM"
           echo "OWASP Dependency-Check Summary for ${DC_PROJECT_NAME}" >> "$SUM"
           echo "Generated: $(date -u +%FT%TZ)" >> "$SUM"
-          echo "" >> "$SUM"
           if [ -f "$JSON" ]; then
-            if command -v jq >/dev/null 2>&1; then
-              jq -r '
-                def sev: .vulnerabilities[].severity // empty;
-                [sev|ascii_downcase] | group_by(.) | map({(.[0]): length}) | add
-              ' "$JSON" 2>/dev/null | sed 's/[{}"]//g; s/: /= /g' >> "$SUM" || true
-            else
-              for s in CRITICAL HIGH MEDIUM LOW; do
-                c=$(grep -o "\"severity\"\\s*:\\s*\"$s\"" "$JSON" | wc -l | tr -d ' ')
-                printf "%s = %s\n" "$s" "$c" >> "$SUM"
-              done
-            fi
-            echo "" >> "$SUM"
+            for s in CRITICAL HIGH MEDIUM LOW; do
+              c=$(grep -o "\"severity\"\\s*:\\s*\"$s\"" "$JSON" | wc -l | tr -d ' ')
+              printf "%s = %s\n" "$s" "$c" >> "$SUM"
+            done
             echo "Reports:" >> "$SUM"
-            [ -f "${R}/dependency-check-report.html" ] && echo "• HTML: ${R}/dependency-check-report.html" >> "$SUM"
-            echo "• XML:  ${R}/dependency-check-report.xml" >> "$SUM"
-            echo "• JSON: ${R}/dependency-check-report.json" >> "$SUM"
+            [ -f "${R}/dependency-check-report.html" ] && echo "HTML: ${R}/dependency-check-report.html" >> "$SUM"
+            echo "XML:  ${R}/dependency-check-report.xml" >> "$SUM"
+            echo "JSON: ${R}/dependency-check-report.json" >> "$SUM"
           else
             echo "No Dependency-Check reports found." >> "$SUM"
           fi
@@ -172,28 +208,21 @@ pipeline {
 
     stage('IaC Scan') {
       steps {
-        echo "Running Checkov IaC scan via pip/venv…"
         sh '''
           set -e
           mkdir -p "${IAC_REPORT_DIR}" "${PIP_CACHE_DIR}" "$(dirname "${CHECKOV_VENV}")"
-
           as_sudo() { if command -v sudo >/dev/null 2>&1; then sudo "$@"; else "$@"; fi; }
-
           if ! command -v python3 >/dev/null 2>&1; then
-            echo "python3 not found. Installing..."
             if command -v apt-get >/dev/null 2>&1; then
               as_sudo apt-get update -y
               as_sudo apt-get install -y python3 python3-venv python3-pip
             elif command -v yum >/dev/null 2>&1; then
               as_sudo yum install -y python3 python3-pip || as_sudo yum install -y python39 python39-pip
             else
-              echo "No supported package manager (apt-get/yum). Aborting." >&2
               exit 1
             fi
           fi
-
           if ! python3 -c "import venv" >/dev/null 2>&1; then
-            echo "python3-venv missing. Installing..."
             if command -v apt-get >/dev/null 2>&1; then
               as_sudo apt-get update -y
               as_sudo apt-get install -y python3-venv
@@ -201,11 +230,8 @@ pipeline {
               as_sudo yum install -y python3-virtualenv || true
             fi
           fi
-
           if [ ! -f "${CHECKOV_VENV}/bin/activate" ]; then
-            echo "Creating virtualenv at ${CHECKOV_VENV}"
             python3 -m venv "${CHECKOV_VENV}" || {
-              echo "Venv creation failed. Retrying..."
               if command -v apt-get >/dev/null 2>&1; then
                 as_sudo apt-get update -y
                 as_sudo apt-get install -y python3-venv python3-pip
@@ -215,33 +241,25 @@ pipeline {
               python3 -m venv "${CHECKOV_VENV}"
             }
           fi
-
           . "${CHECKOV_VENV}/bin/activate"
-          python --version
-          pip --version
-
           pip install --upgrade pip
           pip install --cache-dir "${PIP_CACHE_DIR}" -U "checkov==${CHECKOV_VERSION}"
-
-          echo "Running Checkov across frameworks: ${CHECKOV_FRAMEWORKS}"
           checkov -d "$WORKSPACE" --framework "${CHECKOV_FRAMEWORKS}" --output json > "${IAC_REPORT_DIR}/checkov-report.json" || true
           checkov -d "$WORKSPACE" --framework "${CHECKOV_FRAMEWORKS}" --output junitxml > "${IAC_REPORT_DIR}/checkov-report.xml" || true
-
           deactivate || true
           echo "Runner: pip (venv)" > "${IAC_REPORT_DIR}/runner.txt"
         '''
         junit allowEmptyResults: true, testResults: "${env.IAC_REPORT_DIR}/checkov-report.xml"
-        archiveArtifacts artifacts: "${IAC_REPORT_DIR}/**", fingerprint: true, allowEmptyArchive: true
+        archiveArtifacts artifacts: "${env.IAC_REPORT_DIR}/**", fingerprint: true, allowEmptyArchive: true
       }
     }
   }
 
   post {
     always {
-      echo "Pipeline finished with status: ${currentBuild.currentResult}"
-      echo "OWASP reports in: ${env.DC_REPORT_DIR}/"
-      echo "IaC (Checkov) reports in: ${env.IAC_REPORT_DIR}/"
-      sh 'test -f "${IAC_REPORT_DIR}/runner.txt" && echo "IaC runner: $(cat ${IAC_REPORT_DIR}/runner.txt)" || true'
+      echo "[POST] Result=${currentBuild.currentResult}"
+      echo "[POST] OWASP: ${env.DC_REPORT_DIR}/  IaC: ${env.IAC_REPORT_DIR}/"
+      sh 'test -f "${IAC_REPORT_DIR}/runner.txt" && echo "[POST] IaC runner: $(cat ${IAC_REPORT_DIR}/runner.txt)" || true'
     }
   }
 }
