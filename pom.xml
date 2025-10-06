@@ -61,6 +61,49 @@
 			<artifactId>commons-collections</artifactId>
 			<version>3.2.1</version>
 		</dependency>
+
+		<!-- 🔴 CRITICAL: Very old log4j with known RCE (Log4Shell CVE-2021-44228) -->
+<dependency>
+    <groupId>log4j</groupId>
+    <artifactId>log4j</artifactId>
+    <version>1.2.17</version>
+</dependency>
+
+<!-- 🔴 CRITICAL: Spring Core vulnerability (CVE-2022-22965, "Spring4Shell") -->
+<dependency>
+    <groupId>org.springframework</groupId>
+    <artifactId>spring-core</artifactId>
+    <version>5.2.0.RELEASE</version>
+</dependency>
+
+<!-- 🟠 HIGH: Old commons-collections with deserialization issues -->
+<dependency>
+    <groupId>commons-collections</groupId>
+    <artifactId>commons-collections</artifactId>
+    <version>3.2.1</version>
+</dependency>
+
+<!-- 🟠 HIGH: Old Jackson databind with multiple RCEs (CVE-2019-12086, etc.) -->
+<dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+    <version>2.9.5</version>
+</dependency>
+
+<!-- 🟡 MEDIUM: Guava older than 30 has vulnerabilities -->
+<dependency>
+    <groupId>com.google.guava</groupId>
+    <artifactId>guava</artifactId>
+    <version>20.0</version>
+</dependency>
+
+<!-- 🟢 LOW: Apache Commons BeanUtils (XXE & DoS issues) -->
+<dependency>
+    <groupId>commons-beanutils</groupId>
+    <artifactId>commons-beanutils</artifactId>
+    <version>1.9.2</version>
+</dependency>
+
 	</dependencies>
 
 	<build>
