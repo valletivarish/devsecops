@@ -23,9 +23,9 @@ pipeline {
     DC_REPORT_DIR        = 'dependency-check-reports'
     DC_PROJECT_NAME      = 'petclinic'
     DC_CACHE_DIR         = '/var/jenkins_home/dependency-check-data'
-    DC_VALID_HOURS       = '4'          // used by Dependency-Check itself
-    DC_VALID_MINUTES     = '60'         // cache retention for our purge
-    DC_LOCK_TIMEOUT_MIN  = '10'         // wait for active update before treating lock as stale
+    DC_VALID_HOURS       = '4'
+    DC_VALID_MINUTES     = '60'
+    DC_LOCK_TIMEOUT_MIN  = '10'
 
     DC_FAIL_CRITICAL     = '99'
     DC_UNSTABLE_HIGH     = '2'
@@ -102,7 +102,6 @@ pipeline {
       steps {
         withCredentials([string(credentialsId: env.NVD_API_CRED_ID, variable: 'NVD_API_KEY')]) {
           script {
-            // Lock handling + purge
             sh '''
               set -e
               mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"
@@ -128,7 +127,6 @@ pipeline {
                 fi
               fi
 
-              # Efficient "any stale file?" check without scanning all files
               if find "${DC_CACHE_DIR}" -type f -mmin +${DC_VALID_MINUTES} -print -quit | grep -q .; then
                 echo "[OWASP] Cache older than ${DC_VALID_MINUTES} minute(s) -> purging"
                 rm -rf "${DC_CACHE_DIR:?}/"* || true
@@ -137,7 +135,6 @@ pipeline {
               fi
             '''
 
-            // Run scan
             sh 'mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"'
             def usedMaven = (sh(returnStatus: true, script: "mvn -v >/dev/null 2>&1") == 0)
             if (usedMaven) {
@@ -175,7 +172,14 @@ pipeline {
               )
             }
 
-            // Build summary from parsed JSON (no grep)
+            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+              dependencyCheckPublisher(
+                pattern: "${env.DC_REPORT_DIR}/dependency-check-report.xml",
+                stopBuild: false,
+                skipNoReportFiles: false
+              )
+            }
+
             def jsonPath = "${env.DC_REPORT_DIR}/dependency-check-report.json"
             if (!fileExists(jsonPath)) {
               echo "[OWASP] JSON not found → skipping policy enforcement"
@@ -183,7 +187,6 @@ pipeline {
             }
             def report = readJSON file: jsonPath
             def counts = [CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0]
-
             def normSeverity = { val ->
               if (val == null) return ''
               if (val instanceof String) return val
@@ -191,21 +194,17 @@ pipeline {
               if (val instanceof Map && val.level) return val.level.toString()
               return val.toString()
             }
-
             (report.dependencies ?: []).each { d ->
               (d.vulnerabilities ?: []).each { v ->
                 def s = normSeverity(v.severity).toUpperCase()
                 if (counts.containsKey(s)) counts[s] = counts[s] + 1
               }
             }
-
             int failCrit = env.DC_FAIL_CRITICAL.toInteger()
             int warnHigh = env.DC_UNSTABLE_HIGH.toInteger()
             int warnMed  = env.DC_UNSTABLE_MEDIUM.toInteger()
-
             echo "[OWASP] Counts: CRITICAL=${counts.CRITICAL}, HIGH=${counts.HIGH}, MEDIUM=${counts.MEDIUM}, LOW=${counts.LOW}"
             echo "[OWASP] Thresholds: FAIL_CRITICAL>=${failCrit}, UNSTABLE_HIGH>=${warnHigh}, UNSTABLE_MEDIUM>=${warnMed}"
-
             def owaspSummary = """OWASP Dependency-Check Summary for ${env.DC_PROJECT_NAME}
 Generated: ${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC'))}
 CRITICAL=${counts.CRITICAL}
@@ -214,11 +213,8 @@ MEDIUM=${counts.MEDIUM}
 LOW=${counts.LOW}
 """
             writeFile file: "${env.DC_REPORT_DIR}/OWASP-Dependency-Check-Summary.txt", text: owaspSummary
-
             archiveArtifacts artifacts: "${env.DC_REPORT_DIR}/dependency-check-report.html, ${env.DC_REPORT_DIR}/dependency-check-report.json, ${env.DC_REPORT_DIR}/dependency-check.log, ${env.DC_REPORT_DIR}/OWASP-Dependency-Check-Summary.txt", fingerprint: true, allowEmptyArchive: true
-            sh 'rm -f "${DC_REPORT_DIR}/dependency-check-report.xml" "${DC_REPORT_DIR}/dependency-check-report.sarif" || true'
-
-            // Policy enforcement
+            sh 'rm -f "${DC_REPORT_DIR}/dependency-check-report.sarif" || true'
             if (counts.CRITICAL >= failCrit) {
               error("[OWASP] FAIL: CRITICAL=${counts.CRITICAL} (>= ${failCrit})")
             }
@@ -296,7 +292,6 @@ LOW=${counts.LOW}
           int totalSkipped = 0
           int totalParsingErrors = 0
 
-          // Robust per-framework aggregation
           Map<String,Integer> byFramework = ['TERRAFORM':0, 'KUBERNETES':0, 'DOCKERFILE':0]
 
           reports.each { rep ->
