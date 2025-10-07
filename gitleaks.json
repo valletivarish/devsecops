@@ -1,0 +1,42 @@
+[
+ {
+  "Description": "HashiCorp Terraform password field",
+  "StartLine": 44,
+  "EndLine": 45,
+  "StartColumn": 4,
+  "EndColumn": 1,
+  "Match": "password                = \"insecurepassword\"",
+  "Secret": "\"insecurepassword\"",
+  "File": "main.tf",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.5724313,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "RuleID": "hashicorp-tf-password",
+  "Fingerprint": "main.tf:hashicorp-tf-password:44"
+ },
+ {
+  "Description": "AWS",
+  "StartLine": 10,
+  "EndLine": 10,
+  "StartColumn": 20,
+  "EndColumn": 39,
+  "Match": "AKIA1234567890ABCDEF",
+  "Secret": "AKIA1234567890ABCDEF",
+  "File": "src/main/resources/application.properties",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 4.0841837,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "RuleID": "aws-access-token",
+  "Fingerprint": "src/main/resources/application.properties:aws-access-token:10"
+ }
+]
