@@ -1,0 +1,304 @@
+pipeline {
+  agent any
+
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+  }
+
+  parameters {
+    string(name: 'GIT_BRANCH', defaultValue: 'build_unstable_branch', description: 'Git branch to build (e.g. main)')
+  }
+
+  environment {
+    PIP_CACHE_DIR = '/var/jenkins_home/.cache/pip'
+    SEMGRP_VENV   = '/var/jenkins_home/.venvs/semgrep'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        deleteDir()
+        script {
+          def requested = params.GIT_BRANCH ?: 'main'
+          def trimmed   = requested.trim()
+          def repoUrl   = 'https://github.com/valletivarish/devsecops.git'
+          echo "[SCM] Branch requested='${requested}', using='${trimmed}'"
+          int exists = sh(returnStatus: true, script: "git ls-remote --exit-code --heads ${repoUrl} ${trimmed} >/dev/null 2>&1")
+          def branchToBuild = (exists == 0) ? trimmed : 'main'
+          if (exists != 0) echo "[SCM] '${trimmed}' not found → fallback to 'main'"
+          checkout([$class: 'GitSCM', branches: [[name: "*/${branchToBuild}"]], userRemoteConfigs: [[url: repoUrl, credentialsId: 'github-username-pat']]])
+        }
+      }
+    }
+
+    stage('PII Logging Scan (Semgrep)') {
+      steps {
+        script {
+          echo "[PII] Preparing precise Semgrep rules for model object logging"
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+OUT_DIR=".pii-scan"
+RULES="${PIP_CACHE_DIR}/semgrep-pii-java.yml"
+: "${SEMGRP_VENV:=/var/jenkins_home/.venvs/semgrep}"
+
+rm -rf "$OUT_DIR" || true
+mkdir -p "$OUT_DIR" "$(dirname "$RULES")" "$(dirname "$SEMGRP_VENV")"
+
+cat > "$RULES" <<'YAML'
+rules:
+  - id: pii-system-print
+    languages: [java]
+    message: Direct System.out/err printing; avoid logging personal info
+    severity: WARNING
+    pattern-either:
+      - pattern: System.out.print($X)
+      - pattern: System.out.println($X)
+      - pattern: System.err.print($X)
+      - pattern: System.err.println($X)
+
+  - id: pii-logger-param-model
+    languages: [java]
+    message: PII object logged from method parameter (com.devsecops.myapp.model.*)
+    severity: WARNING
+    pattern-either:
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              public $RET $M(..., com.devsecops.myapp.model.$CLASS $OBJ, ...) { ... }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              public $RET $M(..., com.devsecops.myapp.model.$CLASS $OBJ, ...) { ... }
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              public $RET $M(..., $CLASS $OBJ, ...) { ... }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              public $RET $M(..., $CLASS $OBJ, ...) { ... }
+
+  - id: pii-logger-local-model
+    languages: [java]
+    message: PII object logged from local variable (com.devsecops.myapp.model.*)
+    severity: WARNING
+    pattern-either:
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              {
+                ...
+                com.devsecops.myapp.model.$CLASS $OBJ = ...;
+                ...
+              }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              {
+                ...
+                com.devsecops.myapp.model.$CLASS $OBJ = ...;
+                ...
+              }
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              {
+                ...
+                $CLASS $OBJ = ...;
+                ...
+              }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              {
+                ...
+                $CLASS $OBJ = ...;
+                ...
+              }
+
+  - id: pii-logger-param-collection-model
+    languages: [java]
+    message: PII collection logged from method parameter (List/Set/Optional of model)
+    severity: WARNING
+    pattern-either:
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              public $RET $M(..., $T<com.devsecops.myapp.model.$CLASS> $OBJ, ...) { ... }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              public $RET $M(..., $T<com.devsecops.myapp.model.$CLASS> $OBJ, ...) { ... }
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              public $RET $M(..., $T<$CLASS> $OBJ, ...) { ... }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              public $RET $M(..., $T<$CLASS> $OBJ, ...) { ... }
+
+  - id: pii-logger-local-collection-model
+    languages: [java]
+    message: PII collection logged from local variable (List/Set/Optional of model)
+    severity: WARNING
+    pattern-either:
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              {
+                ...
+                $T<com.devsecops.myapp.model.$CLASS> $OBJ = ...;
+                ...
+              }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              {
+                ...
+                $T<com.devsecops.myapp.model.$CLASS> $OBJ = ...;
+                ...
+              }
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              {
+                ...
+                $T<$CLASS> $OBJ = ...;
+                ...
+              }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern: import com.devsecops.myapp.model.$CLASS;
+          - pattern-inside: |
+              {
+                ...
+                $T<$CLASS> $OBJ = ...;
+                ...
+              }
+
+  - id: pii-logger-serialization
+    languages: [java]
+    message: Object serialization logged; ensure PII is redacted
+    severity: WARNING
+    pattern-either:
+      - pattern: $LOG.$LEVEL($X.toString(), ...)
+      - pattern: $LOG.$LEVEL(toJson($X), ...)
+      - pattern: $LOG.$LEVEL($M.writeValueAsString($X), ...)
+      - pattern: $LOG.$LEVEL(..., $X.toString(), ...)
+      - pattern: $LOG.$LEVEL(..., toJson($X), ...)
+      - pattern: $LOG.$LEVEL(..., $M.writeValueAsString($X), ...)
+    metavariable-regex:
+      metavariable: $LOG
+      regex: (?i)^(logger|log)$
+YAML
+
+SEMGRP=""
+if [ -x "${SEMGRP_VENV}/bin/semgrep" ]; then
+  SEMGRP="${SEMGRP_VENV}/bin/semgrep"
+elif command -v semgrep >/dev/null 2>&1; then
+  SEMGRP="$(command -v semgrep)"
+else
+  if ! command -v python3 >/dev/null 2>&1; then echo "[PII] Python3 is required"; exit 127; fi
+  if [ ! -f "${SEMGRP_VENV}/bin/activate" ]; then python3 -m venv "${SEMGRP_VENV}"; fi
+  . "${SEMGRP_VENV}/bin/activate"
+  pip install --upgrade pip
+  pip install --cache-dir "${PIP_CACHE_DIR}" -U semgrep
+  SEMGRP="${SEMGRP_VENV}/bin/semgrep"
+fi
+
+if "${SEMGRP}" scan --help >/dev/null 2>&1; then
+  CMD=("${SEMGRP}" "scan")
+else
+  CMD=("${SEMGRP}")
+fi
+
+echo "[PII] Running: ${CMD[*]} --quiet --config $RULES --json -o ${OUT_DIR}/semgrep.json ."
+"${CMD[@]}" --quiet --config "$RULES" --json -o "${OUT_DIR}/semgrep.json" . || true
+
+python3 - <<'PY' "${OUT_DIR}/semgrep.json" "${OUT_DIR}/findings.csv" "${OUT_DIR}/summary.txt"
+import json, sys, csv, os
+jpath, csvpath, sumpath = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {"results": []}
+if os.path.exists(jpath):
+    with open(jpath, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except Exception:
+            pass
+rows = [("file","line","rule_id","message","code")]
+for r in data.get("results", []):
+    file = r.get("path","")
+    line = (r.get("start") or {}).get("line","")
+    rid  = r.get("check_id","")
+    msg  = (r.get("extra") or {}).get("message","")
+    code = (r.get("extra") or {}).get("lines","").strip()
+    rows.append((file,line,rid,msg,code))
+with open(csvpath, "w", newline="", encoding="utf-8") as f:
+    csv.writer(f).writerows(rows)
+total = max(0, len(rows)-1)
+with open(sumpath, "w", encoding="utf-8") as f:
+    f.write(f"TOTAL={total}\\n")
+print(f"TOTAL={total}")
+PY
+'''
+          archiveArtifacts artifacts: ".pii-scan/semgrep.json,.pii-scan/findings.csv,.pii-scan/summary.txt", fingerprint: true, allowEmptyArchive: true
+          def total = sh(script: "grep -Eo 'TOTAL=([0-9]+)' .pii-scan/summary.txt | cut -d= -f2 || echo 0", returnStdout: true).trim()
+          echo "[PII] Total issues: ${total}"
+          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            if ((total as Integer) > 0) {
+              error("[PII] UNSTABLE: Semgrep detected potential PII logging. See .pii-scan/findings.csv and .pii-scan/semgrep.json")
+            }
+          }
+          echo "[PII] Scan complete"
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "[POST] Result=${currentBuild.currentResult}"; echo "[POST] PII artifacts: .pii-scan/" }
+    unstable { echo "[POST] Result=${currentBuild.currentResult}"; echo "[POST] PII artifacts: .pii-scan/" }
+  }
+}
