@@ -27,6 +27,8 @@ public class CustomerController {
     @PostMapping
     public ResponseEntity<Customer> create(@RequestBody Customer c) {
         logger.info("Creating new customer...{}",c);
+        logger.info("Creating new customer...{}",c);
+        logger.info("Creating new customer...{}",c);
         Customer created = service.create(c);
         logger.info("Customer created with ID: {}", created.getId());
         return ResponseEntity.status(HttpStatus.CREATED).body(created);
