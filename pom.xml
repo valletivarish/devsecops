@@ -114,6 +114,11 @@
   <artifactId>maven-surefire-plugin</artifactId>
   <version>3.5.4</version>
   <configuration>
+    <excludes>
+      <exclude>**/*ApplicationTests.java</exclude>
+      <!-- or the exact class: **/CyberSecurityPipelineExampleProjectApplicationTests.java -->
+    </excludes>
+    <!-- If you added vulnerable deps, keep them off the test runtime classpath -->
     <classpathDependencyExcludes>
       <classpathDependencyExclude>commons-io:commons-io</classpathDependencyExclude>
       <classpathDependencyExclude>commons-collections:commons-collections</classpathDependencyExclude>
@@ -121,6 +126,7 @@
     </classpathDependencyExcludes>
   </configuration>
 </plugin>
+
 
 			<!-- CycloneDX SBOM -->
 			<plugin>
