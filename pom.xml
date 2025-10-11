@@ -109,6 +109,19 @@
 					</excludes>
 				</configuration>
 			</plugin>
+			<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-surefire-plugin</artifactId>
+  <version>3.5.4</version>
+  <configuration>
+    <classpathDependencyExcludes>
+      <classpathDependencyExclude>commons-io:commons-io</classpathDependencyExclude>
+      <classpathDependencyExclude>commons-collections:commons-collections</classpathDependencyExclude>
+      <classpathDependencyExclude>com.fasterxml.jackson.core:jackson-databind</classpathDependencyExclude>
+    </classpathDependencyExcludes>
+  </configuration>
+</plugin>
+
 			<!-- CycloneDX SBOM -->
 			<plugin>
 				<groupId>org.cyclonedx</groupId>
