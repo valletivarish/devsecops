@@ -46,3 +46,54 @@ resource "aws_db_instance" "public_rds" {
   publicly_accessible     = true
   skip_final_snapshot     = true
 }
+# 6) Security group allows all traffic (CRITICAL)
+resource "aws_security_group" "all_open" {
+  name        = "allow-all"
+  description = "Allows all inbound traffic"
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# 7) S3 bucket without encryption (HIGH)
+resource "aws_s3_bucket" "unencrypted_bucket" {
+  bucket = "unencrypted-bucket-xyz"
+}
+# Missing aws_s3_bucket_server_side_encryption_configuration
+
+# 8) EC2 instance with plaintext secrets (HIGH)
+resource "aws_instance" "bad_instance" {
+  ami           = "ami-12345678"
+  instance_type = "t2.micro"
+  user_data     = <<-EOF
+    #!/bin/bash
+    echo "DB_PASSWORD=SuperSecret123" >> /etc/environment
+  EOF
+}
+
+# 9) CloudTrail without log validation (HIGH)
+resource "aws_cloudtrail" "insecure_trail" {
+  name                          = "insecure-trail"
+  s3_bucket_name                = aws_s3_bucket.public_bucket.id
+  include_global_service_events = true
+  enable_log_file_validation    = false # Bad practice
+}
+
+# 10) EKS cluster public endpoint (HIGH)
+resource "aws_eks_cluster" "public_eks" {
+  name     = "public-eks"
+  role_arn = "arn:aws:iam::123456789012:role/eks-role"
+  vpc_config {
+    endpoint_public_access = true
+    endpoint_private_access = false
+  }
+}
