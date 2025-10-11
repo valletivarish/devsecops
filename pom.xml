@@ -53,30 +53,47 @@
   <groupId>org.springframework.boot</groupId>
   <artifactId>spring-boot-starter-actuator</artifactId>
 </dependency>
-      <dependency>
-        <groupId>commons-io</groupId>
-        <artifactId>commons-io</artifactId>
-        <version>2.4</version>
-        <scope>test</scope>
-      </dependency>
-	        <dependency>
-        <groupId>commons-collections</groupId>
-        <artifactId>commons-collections</artifactId>
-        <version>3.2.1</version>
-        <scope>test</scope>
-      </dependency>
-      <dependency>
-        <groupId>com.fasterxml.jackson.core</groupId>
-        <artifactId>jackson-databind</artifactId>
-        <version>2.9.5</version>
-        <scope>test</scope>
-      </dependency>
-
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-test</artifactId>
-			<scope>test</scope>
+<dependency>
+			<groupId>commons-collections</groupId>
+			<artifactId>commons-collections</artifactId>
+			<version>3.2.1</version>
 		</dependency>
+
+
+<!-- 🔴 CRITICAL: Spring Core vulnerability (CVE-2022-22965, "Spring4Shell") -->
+<dependency>
+    <groupId>org.springframework</groupId>
+    <artifactId>spring-core</artifactId>
+    <version>5.2.0.RELEASE</version>
+</dependency>
+
+<!-- 🟠 HIGH: Old commons-collections with deserialization issues -->
+<dependency>
+    <groupId>commons-collections</groupId>
+    <artifactId>commons-collections</artifactId>
+    <version>3.2.1</version>
+</dependency>
+
+<!-- 🟠 HIGH: Old Jackson databind with multiple RCEs (CVE-2019-12086, etc.) -->
+<dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+    <version>2.9.5</version>
+</dependency>
+
+<!-- 🟡 MEDIUM: Guava older than 30 has vulnerabilities -->
+<dependency>
+    <groupId>com.google.guava</groupId>
+    <artifactId>guava</artifactId>
+    <version>20.0</version>
+</dependency>
+
+<!-- 🟢 LOW: Apache Commons BeanUtils (XXE & DoS issues) -->
+<dependency>
+    <groupId>commons-beanutils</groupId>
+    <artifactId>commons-beanutils</artifactId>
+    <version>1.9.2</version>
+</dependency>
 		
 	</dependencies>
 
@@ -120,7 +137,7 @@
     </excludes>
     <!-- If you added vulnerable deps, keep them off the test runtime classpath -->
     <classpathDependencyExcludes>
-      <classpathDependencyExclude>commons-io:commons-io</classpathDependencyExclude>
+      <classpathDependencyExclude>spring-core</classpathDependencyExclude>
       <classpathDependencyExclude>commons-collections:commons-collections</classpathDependencyExclude>
       <classpathDependencyExclude>com.fasterxml.jackson.core:jackson-databind</classpathDependencyExclude>
     </classpathDependencyExcludes>
