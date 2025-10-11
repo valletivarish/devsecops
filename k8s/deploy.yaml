@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-deploy
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bad }
+  template:
+    metadata:
+      labels: { app: bad }
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest # latest tag (MED)
+          securityContext:
+            runAsUser: 0 # run as root (HIGH)
+            allowPrivilegeEscalation: true # HIGH
+            privileged: true # HIGH
+          ports:
+            - containerPort: 80
