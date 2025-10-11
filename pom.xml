@@ -21,9 +21,9 @@
     <java.version>17</java.version>
     <dependency-check.version>12.1.6</dependency-check.version>
     <cyclonedx.version>2.8.0</cyclonedx.version>
-    <!-- OWASP: 0 = report-only; override in CI if you want failures -->
     <dependency-check.failBuildOnCVSS>0</dependency-check.failBuildOnCVSS>
     <lombok.version>1.18.34</lombok.version>
+    <vuln.dir>${project.build.directory}/vuln-libs</vuln.dir>
   </properties>
 
   <dependencies>
@@ -41,23 +41,25 @@
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
 
-    <!-- Dev/runtime utilities -->
+    <!-- runtime / dev -->
     <dependency>
       <groupId>com.h2database</groupId>
       <artifactId>h2</artifactId>
       <scope>runtime</scope>
     </dependency>
     <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-devtools</artifactId>
+      <scope>runtime</scope>
+      <optional>true</optional>
+    </dependency>
+
+    <!-- Lombok -->
+    <dependency>
       <groupId>org.projectlombok</groupId>
       <artifactId>lombok</artifactId>
       <version>${lombok.version}</version>
       <scope>provided</scope>
-      <optional>true</optional>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-devtools</artifactId>
-      <scope>runtime</scope>
       <optional>true</optional>
     </dependency>
 
@@ -69,22 +71,14 @@
     </dependency>
 
     <!-- =========================
-         Intentionally vulnerable deps (for scanners)
-         Test scope + excluded at test runtime
+         Intentionally vulnerable libs (kept off test runtime)
          ========================= -->
-    <!-- HIGH: Commons Collections 3.x deserialization -->
+
+    <!-- HIGH: Commons Collections (deserialization) -->
     <dependency>
       <groupId>commons-collections</groupId>
       <artifactId>commons-collections</artifactId>
       <version>3.2.1</version>
-      <scope>test</scope>
-    </dependency>
-
-    <!-- HIGH: Jackson databind old line -->
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-databind</artifactId>
-      <version>2.9.5</version>
       <scope>test</scope>
     </dependency>
 
@@ -103,17 +97,20 @@
       <version>2.14.1</version>
       <scope>test</scope>
     </dependency>
+
+    <!-- IMPORTANT: do NOT add vulnerable jackson-databind here.
+         We will fetch it into a folder for OWASP to scan to avoid classpath clashes. -->
   </dependencies>
 
   <build>
     <plugins>
-      <!-- Compiler (use defaults from Boot; no annotationProcessorPaths needed) -->
+      <!-- Compiler -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
       </plugin>
 
-      <!-- Spring Boot plugin -->
+      <!-- Spring Boot -->
       <plugin>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
@@ -127,20 +124,63 @@
         </configuration>
       </plugin>
 
-      <!-- Make tests ignore the vulnerable jars at runtime -->
+      <!-- Keep vulnerable libs OFF the test runtime classpath -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.4</version>
         <configuration>
           <classpathDependencyExcludes>
-            <!-- must be groupId:artifactId -->
             <classpathDependencyExclude>commons-collections:commons-collections</classpathDependencyExclude>
-            <classpathDependencyExclude>com.fasterxml.jackson.core:jackson-databind</classpathDependencyExclude>
             <classpathDependencyExclude>commons-io:commons-io</classpathDependencyExclude>
             <classpathDependencyExclude>org.apache.logging.log4j:log4j-core</classpathDependencyExclude>
+            <!-- Do NOT exclude jackson; Boot’s managed Jackson must remain available -->
           </classpathDependencyExcludes>
         </configuration>
+      </plugin>
+
+      <!-- Fetch extra vulnerable jars OUTSIDE the project classpath for OWASP scanning -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <execution>
+            <id>fetch-vulnerable-jars</id>
+            <phase>generate-resources</phase>
+            <goals>
+              <goal>copy</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${vuln.dir}</outputDirectory>
+              <overWriteIfNewer>true</overWriteIfNewer>
+              <artifactItems>
+                <!-- Old Jackson kept OUTSIDE the test runtime -->
+                <artifactItem>
+                  <groupId>com.fasterxml.jackson.core</groupId>
+                  <artifactId>jackson-databind</artifactId>
+                  <version>2.9.5</version>
+                </artifactItem>
+                <!-- You can mirror the others too, if you want OWASP to scan both POM + folder -->
+                <artifactItem>
+                  <groupId>commons-collections</groupId>
+                  <artifactId>commons-collections</artifactId>
+                  <version>3.2.1</version>
+                </artifactItem>
+                <artifactItem>
+                  <groupId>commons-io</groupId>
+                  <artifactId>commons-io</artifactId>
+                  <version>2.4</version>
+                </artifactItem>
+                <artifactItem>
+                  <groupId>org.apache.logging.log4j</groupId>
+                  <artifactId>log4j-core</artifactId>
+                  <version>2.14.1</version>
+                </artifactItem>
+              </artifactItems>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
 
       <!-- CycloneDX SBOM -->
@@ -162,7 +202,7 @@
         </executions>
       </plugin>
 
-      <!-- OWASP Dependency-Check (reporting by default) -->
+      <!-- OWASP Dependency-Check: scan project deps + extra folder -->
       <plugin>
         <groupId>org.owasp</groupId>
         <artifactId>dependency-check-maven</artifactId>
@@ -178,10 +218,23 @@
         <configuration>
           <failBuildOnCVSS>${dependency-check.failBuildOnCVSS}</failBuildOnCVSS>
           <format>ALL</format>
-          <skipProvidedScope>true</skipProvidedScope>
+
+          <!-- Include normal project dependencies -->
+          <skipProvidedScope>false</skipProvidedScope>
           <skipSystemScope>true</skipSystemScope>
+
+          <!-- Also scan the copied vulnerable jars -->
+          <scanSet>
+            <scanFileSet>
+              <directory>${vuln.dir}</directory>
+              <includes>
+                <include>**/*.jar</include>
+              </includes>
+            </scanFileSet>
+          </scanSet>
         </configuration>
       </plugin>
+
     </plugins>
   </build>
 </project>
