@@ -1,0 +1,846 @@
+pipeline {
+  agent any
+
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  parameters {
+    string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Git branch to build (e.g. main)')
+  }
+
+  tools {
+    maven 'Maven3'
+    jdk   'JDK17'
+  }
+
+  environment {
+    // === Credentials & tool names ===
+    SONAR_TOKEN_ID       = 'SONAR_TOKEN'
+    NVD_API_CRED_ID      = 'NVD_API_key'
+    ODC_TOOL_NAME        = 'OWASP DC'
+
+
+    // === Dependency-Check (OWASP DC) ===
+    DC_REPORT_DIR        = 'dependency-check-reports'
+    DC_PROJECT_NAME      = 'petclinic'
+    DC_CACHE_DIR         = '/var/jenkins_home/dependency-check-data'
+    DC_VALID_HOURS       = '4'
+    DC_VALID_MINUTES     = '60'
+    DC_LOCK_TIMEOUT_MIN  = '10'
+
+    DC_FAIL_CRITICAL     = '99'
+    DC_UNSTABLE_HIGH     = '2'
+    DC_UNSTABLE_MEDIUM   = '5'
+
+    // === IaC / Checkov ===
+    IAC_REPORT_DIR       = 'iac-reports'
+    CHECKOV_VENV         = '/var/jenkins_home/.venvs/checkov'
+    PIP_CACHE_DIR        = '/var/jenkins_home/.cache/pip'
+    SEMGRP_VENV          = '/var/jenkins_home/.venvs/semgrep'
+    MODEL_PACKAGE        = 'com.devsecops.myapp.model'
+    CHECKOV_FRAMEWORKS   = 'dockerfile,kubernetes,terraform'
+    CHECKOV_VERSION      = '3.2.473'
+
+    IAC_UNSTABLE_TOTAL           = '5'
+    IAC_UNSTABLE_TERRAFORM       = '0'
+    IAC_UNSTABLE_KUBERNETES      = '0'
+    IAC_UNSTABLE_DOCKERFILE      = '0'
+    IAC_UNSTABLE_PARSING_ERRORS  = '1'
+
+    // === Trivy ===
+    TRIVY_REPORT_DIR     = 'trivy-reports'
+    TRIVY_FAIL_CRITICAL  = '1'
+    TRIVY_UNSTABLE_HIGH  = '5'
+    TRIVY_UNSTABLE_MEDIUM= '10'
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        deleteDir()
+        script {
+          def requested = params.GIT_BRANCH ?: 'main'
+          def trimmed   = requested.trim()
+          def repoUrl   = 'https://github.com/valletivarish/devsecops.git'
+          echo "[SCM] Branch requested='${requested}', using='${trimmed}'"
+          int exists = sh(returnStatus: true, script: "git ls-remote --exit-code --heads ${repoUrl} ${trimmed} >/dev/null 2>&1")
+          def branchToBuild = (exists == 0) ? trimmed : 'main'
+          if (exists != 0) echo "[SCM] '${trimmed}' not found → fallback to 'main'"
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: "*/${branchToBuild}"]],
+            userRemoteConfigs: [[url: repoUrl, credentialsId: 'github-username-pat']]
+          ])
+        }
+      }
+    }
+
+    // ====== Security pre-build scans ======
+    stage('PII Logging Scan') {
+      steps {
+        script {
+          echo "[PII] Preparing Semgrep rules for package: ${env.MODEL_PACKAGE}.*"
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+OUT_DIR=".pii-scan"
+RULES="${PIP_CACHE_DIR}/semgrep-pii-java.yml"
+SEMGRP="${SEMGRP_VENV}/bin/semgrep"
+
+rm -rf "${OUT_DIR}" || true
+mkdir -p "${OUT_DIR}" "$(dirname "${RULES}")"
+
+if [ ! -x "${SEMGRP}" ]; then
+  echo "[PII] Semgrep not found at ${SEMGRP}. Install it into the venv before running."
+  exit 127
+fi
+
+cat > "${RULES}" <<'YAML'
+rules:
+  - id: pii-system-print
+    languages: [java]
+    message: Direct System.out/err printing; avoid logging personal info
+    severity: WARNING
+    pattern-either:
+      - pattern: System.out.print($X)
+      - pattern: System.out.println($X)
+      - pattern: System.err.print($X)
+      - pattern: System.err.println($X)
+
+  - id: pii-logger-param-model
+    languages: [java]
+    message: PII object logged from method parameter (__MODEL_PACKAGE__.*)
+    severity: WARNING
+    pattern-either:
+      - patterns:
+          - pattern: $LOG.$LEVEL($MSG, $OBJ, ...)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              public $RET $M(..., __MODEL_PACKAGE__.$CLASS $OBJ, ...) { ... }
+      - patterns:
+          - pattern: $LOG.$LEVEL($OBJ)
+          - metavariable-regex: { metavariable: $LOG, regex: (?i)^(logger|log)$ }
+          - metavariable-regex: { metavariable: $LEVEL, regex: ^(trace|debug|info|warn|error|fatal)$ }
+          - pattern-inside: |
+              public $RET $M(..., __MODEL_PACKAGE__.$CLASS $OBJ, ...) { ... }
+YAML
+
+sed -i "s|__MODEL_PACKAGE__|${MODEL_PACKAGE}|g" "${RULES}"
+
+echo "[PII] Running: ${SEMGRP} scan --quiet --config ${RULES} --json -o ${OUT_DIR}/semgrep.json ."
+"${SEMGRP}" scan --quiet --config "${RULES}" --json -o "${OUT_DIR}/semgrep.json" . || true
+
+python3 - <<'PY' "${OUT_DIR}/semgrep.json" "${OUT_DIR}/findings.csv" "${OUT_DIR}/summary.txt"
+import json, sys, csv, os
+jpath, csvpath, sumpath = sys.argv[1], sys.argv[2], sys.argv[3]
+data={"results":[]}
+if os.path.exists(jpath):
+    with open(jpath,"r",encoding="utf-8") as f:
+        try: data=json.load(f)
+        except Exception: pass
+rows=[("file","line","rule_id","message")]
+for r in data.get("results",[]):
+    file=r.get("path","")
+    line=(r.get("start") or {}).get("line","")
+    rid=r.get("check_id","")
+    msg=(r.get("extra") or {}).get("message","")
+    rows.append((file,line,rid,msg))
+with open(csvpath,"w",newline="",encoding="utf-8") as f:
+    csv.writer(f).writerows(rows)
+total=max(0,len(rows)-1)
+with open(sumpath,"w",encoding="utf-8") as f:
+    f.write(f"TOTAL={total}\\n")
+print(f"TOTAL={total}")
+PY
+'''
+          def total = sh(script: """
+            if [ -f ".pii-scan/summary.txt" ]; then
+              grep -Eo 'TOTAL=([0-9]+)' .pii-scan/summary.txt | cut -d= -f2 || echo 0
+            else
+              echo 0
+            fi
+          """, returnStdout: true).trim()
+
+          echo "[PII] Total issues: ${total}"
+
+          archiveArtifacts artifacts: ".pii-scan/semgrep.json,.pii-scan/findings.csv,.pii-scan/summary.txt", fingerprint: true, allowEmptyArchive: true
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            if ((total as Integer) > 0) {
+              error("[PII] UNSTABLE: Semgrep detected potential PII logging. See archived artifacts.")
+            }
+          }
+          echo "[PII] Scan complete"
+        }
+      }
+    }
+
+    stage('Secret Scan (Gitleaks)') {
+      steps {
+        script {
+          echo "[Secret Scan] Starting secret scan for branch: ${params.GIT_BRANCH}"
+
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[Secret Scan] Checking for gitleaks binary..."
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "[Secret Scan] Installing gitleaks"
+  curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz" -o gitleaks.tar.gz
+  tar -xzf gitleaks.tar.gz
+  install gitleaks /usr/local/bin/
+fi
+
+echo "[Secret Scan] Checking for jq binary..."
+if ! command -v jq >/dev/null 2>&1; then
+  echo "[Secret Scan] Installing jq"
+  if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y jq
+  elif command -v yum >/dev/null 2>&1; then yum install -y jq
+  else exit 1; fi
+fi
+
+ART_DIR=".secret-scan-artifacts"
+rm -rf "$ART_DIR" || true
+mkdir -p "$ART_DIR"
+
+echo "[Secret Scan] Running gitleaks..."
+gitleaks detect --no-git --source "." -f json -r "${ART_DIR}/findings-raw.json" --no-banner || true
+echo "[Secret Scan] Findings saved at ${ART_DIR}/findings-raw.json"
+'''
+
+          archiveArtifacts artifacts: '.secret-scan-artifacts/findings-raw.json', fingerprint: true, allowEmptyArchive: true
+          echo "[Secret Scan] Findings archived."
+
+          def count = sh(script: '''
+            f=".secret-scan-artifacts/findings-raw.json"
+            if [ ! -s "$f" ]; then echo 0; exit 0; fi
+            if ! jq -e 'type=="array"' "$f" >/dev/null 2>&1; then echo 0; exit 0; fi
+            jq 'length' "$f"
+          ''', returnStdout: true).trim() as Integer
+
+          if (count > 0) {
+            echo "[Secret Scan] Detected ${count} potential secret(s)."
+
+            def list = sh(script: '''#!/usr/bin/env bash
+f=".secret-scan-artifacts/findings-raw.json"
+jq -r '.[] | "\\(.File):\\(.StartLine)"' "$f" | head -n 20
+''', returnStdout: true).trim()
+
+            def authorEmail = sh(script: 'git log -1 --pretty=format:%ae', returnStdout: true).trim()
+            if (!authorEmail) {
+              authorEmail = sh(script: 'git log -1 --pretty=format:%ce', returnStdout: true).trim()
+            }
+
+            def msg = """Secret Scan Alert
+
+Jenkins Job:   ${env.JOB_NAME}
+Build Number:  #${env.BUILD_NUMBER}
+Branch:        ${params.GIT_BRANCH}
+Build URL:     ${env.BUILD_URL}
+
+----------------------------------------
+Total Secrets Found: ${count}
+----------------------------------------
+
+Top Findings (file : line)
+${list}
+
+Full JSON Report:
+${env.BUILD_URL}artifact/.secret-scan-artifacts/findings-raw.json
+"""
+
+            if (authorEmail) {
+              echo "[Secret Scan] Sending email notification to ${authorEmail}"
+              mail to: authorEmail,
+                   subject: "Secret scan detected ${count} potential secret(s) in ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                   body: msg
+            } else {
+              echo "[Secret Scan] No commit author email detected; skipping email notification."
+            }
+
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+              error("[Secret Scan] Marking stage as UNSTABLE because secrets were found.")
+            }
+            echo "[Secret Scan] Stage marked UNSTABLE (pipeline continues)."
+          } else {
+            echo "[Secret Scan] No secrets found."
+          }
+        }
+      }
+    }
+
+    // ====== Standard Maven lifecycle ======
+    stage('Compile') {
+      steps {
+        echo "[COMPILE] mvn clean compile"
+        sh 'mvn -B -DskipTests -Dcheckstyle.skip=true -Ddependency-check.skip=true clean compile'
+      }
+    }
+
+    stage('Test') {
+      steps {
+        echo "[TEST] mvn test"
+        sh 'mvn -B -Dcheckstyle.skip=true -Ddependency-check.skip=true test'
+      }
+      post {
+        always {
+          echo "[TEST] Publishing JUnit"
+          junit allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml'
+        }
+      }
+    }
+
+   stage('Package') {
+  steps {
+    echo "[PACKAGE] mvn package"
+    sh "mvn -B -DskipTests -Dcheckstyle.skip=true -Ddependency-check.skip=true package"
+    echo "[PACKAGE] Skipping artifact archiving"
+  }
+}
+
+
+
+    // ====== Run-time health verification on built JAR ======
+    stage('Health Check') {
+      steps {
+        script {
+            def pom = readMavenPom file: 'pom.xml'
+def jarPath = "target/${pom.artifactId}-${pom.version}.jar"
+sh """
+  set -e
+  JAR_FILE='${jarPath}'
+  if [ ! -f "\$JAR_FILE" ]; then
+    echo "[HEALTH] Application JAR not found: \$JAR_FILE"
+    exit 1
+  fi
+
+            pick_free_port() {
+              CANDS="18080 19090 20080 21080"
+              for p in \$CANDS; do
+                if command -v ss >/dev/null 2>&1; then
+                  ss -ltn | awk '{print \$4}' | grep -Eq "[:.]\\\$p\$" || { echo "\$p"; return; }
+                elif command -v lsof >/dev/null 2>&1; then
+                  lsof -iTCP -sTCP:LISTEN -P | awk '{print \$9}' | grep -Eq "[:.]\\\$p\$" || { echo "\$p"; return; }
+                else
+                  netstat -tln 2>/dev/null | awk '{print \$4}' | grep -Eq "[:.]\\\$p\$" || { echo "\$p"; return; }
+                fi
+              done
+              echo 18080
+            }
+
+            APP_P=\$(pick_free_port)
+            MGMT_P=\$((APP_P+1))
+
+            echo "[HEALTH] App port=\$APP_P  Mgmt port=\$MGMT_P"
+            echo "[HEALTH] Launch: java -jar \"\$JAR_FILE\" --server.port=\$APP_P --management.server.port=\$MGMT_P"
+
+            nohup java -jar "\$JAR_FILE" \\
+              --server.port=\$APP_P \\
+              --management.server.port=\$MGMT_P \\
+              --management.endpoints.web.exposure.include=health \\
+              --management.endpoint.health.show-details=never \\
+              > app.log 2>&1 &
+
+            APP_PID=\$!
+            echo \$APP_PID > app.pid
+
+            ATTEMPTS=45
+            while :; do
+              if ! kill -0 \$APP_PID 2>/dev/null; then
+                echo "[HEALTH] App process exited early. Last 120 lines:"
+                tail -n 120 app.log || true
+                exit 1
+              fi
+              if curl -sf "http://localhost:\$MGMT_P/actuator/health" >/dev/null 2>&1; then
+                break
+              fi
+              ATTEMPTS=\$((ATTEMPTS-1))
+              if [ \$ATTEMPTS -le 0 ]; then
+                echo "[HEALTH] Actuator not reachable on port \$MGMT_P. Last 120 lines:"
+                tail -n 120 app.log || true
+                exit 1
+              fi
+              echo "[HEALTH] Waiting for http://localhost:\$MGMT_P/actuator/health ..."
+              sleep 2
+            done
+
+            RAW=\$(curl -s "http://localhost:\$MGMT_P/actuator/health" || echo "")
+            STATUS=\$(printf "%s" "\$RAW" | awk -F'\\\"' '/\\\"status\\\"/{print \$4; exit}')
+            echo "[HEALTH] Raw=\$RAW"
+            echo "[HEALTH] Status=\$STATUS"
+            if [ "\$STATUS" != "UP" ]; then
+              echo "[HEALTH] Unhealthy status"
+              tail -n 120 app.log || true
+              exit 1
+            fi
+          """
+        }
+      }
+      post {
+        always {
+          echo "[HEALTH] Stopping application"
+          sh '''
+            if [ -f app.pid ]; then
+              kill $(cat app.pid) >/dev/null 2>&1 || true
+              rm -f app.pid
+            fi
+          '''
+          echo "[HEALTH] Archiving startup log"
+          archiveArtifacts artifacts: 'app.log', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Install') {
+      steps {
+        echo "[INSTALL] mvn clean install"
+        sh 'mvn -B -Dcheckstyle.skip=true -Ddependency-check.skip=true clean install'
+      }
+    }
+
+    // ====== Code quality ======
+    stage('SonarQube Analysis') {
+      steps {
+        withCredentials([string(credentialsId: env.SONAR_TOKEN_ID, variable: 'SONAR_TOKEN')]) {
+          sh '''
+            set -e
+            probe(){ url="$1"; [ -z "$url" ] && return 1; curl -sSf --max-time 3 "$url/api/system/status" >/dev/null 2>&1; }
+            GATEWAY_IP="$(ip route | awk '/default/ {print $3; exit}')" || true
+            FIRST_IPV4="$(ip -4 addr show scope global 2>/dev/null | awk "/inet /{print \\$2}" | cut -d/ -f1 | head -n1)" || true
+            HOST_IP_ALT="$(hostname -I 2>/dev/null | awk "{print \\$1}")" || true
+            CANDS="${SONAR_HOST_URL:-} http://localhost:9000 http://127.0.0.1:9000 http://${GATEWAY_IP}:9000 http://host.docker.internal:9000 http://${FIRST_IPV4}:9000 http://${HOST_IP_ALT}:9000"
+            for u in $CANDS; do if probe "$u"; then SURL="$u"; break; fi; done
+            if [ -z "$SURL" ]; then echo "[SONAR] Not reachable → skipping"; exit 0; fi
+            echo "[SONAR] Using: $SURL"
+            mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+              -DskipTests -Dcheckstyle.skip=true \
+              -Dsonar.projectKey=petclinic -Dsonar.projectName="petclinic" \
+              -Dsonar.host.url="$SURL" -Dsonar.token="$SONAR_TOKEN"
+          '''
+        }
+      }
+    }
+
+    // ====== Dependency scanning (OWASP DC) ======
+    stage('OWASP Dependency-Check') {
+      steps {
+        withCredentials([string(credentialsId: env.NVD_API_CRED_ID, variable: 'NVD_API_KEY')]) {
+          script {
+            sh '''
+              set -e
+              mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"
+
+              LOCK="${DC_CACHE_DIR}/jsrepository.json.lock"
+              WAIT_SECS=$(( (${DC_LOCK_TIMEOUT_MIN:-10}) * 60 ))
+
+              if [ -f "$LOCK" ]; then
+                echo "[OWASP] Lock file found: $LOCK"
+                start=$(date +%s)
+                while [ -f "$LOCK" ] && [ $(( $(date +%s) - start )) -lt $WAIT_SECS ]; do
+                  sleep 5
+                done
+                if [ -f "$LOCK" ]; then
+                  mtime=$( (stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK") )
+                  age_sec=$(( $(date +%s) - mtime ))
+                  if [ "$age_sec" -ge "$WAIT_SECS" ]; then
+                    echo "[OWASP] Stale lock (age ${age_sec}s) -> removing"
+                    rm -f "$LOCK" || true
+                  else
+                    echo "[OWASP] Lock likely active (age ${age_sec}s) -> continuing"
+                  fi
+                fi
+              fi
+
+              if find "${DC_CACHE_DIR}" -type f -mmin +${DC_VALID_MINUTES} -print -quit | grep -q .; then
+                echo "[OWASP] Cache older than ${DC_VALID_MINUTES} minute(s) -> purging"
+                rm -rf "${DC_CACHE_DIR:?}/"* || true
+              else
+                echo "[OWASP] Cache fresh (<${DC_VALID_MINUTES} min)"
+              fi
+            '''
+
+            sh 'mkdir -p "${DC_CACHE_DIR}" "${DC_REPORT_DIR}"'
+            def usedMaven = (sh(returnStatus: true, script: "mvn -v >/dev/null 2>&1") == 0)
+            if (usedMaven) {
+              echo "[OWASP] Runner: Maven plugin"
+              sh '''
+                set -e
+                mvn -B org.owasp:dependency-check-maven:check \
+                  -Dformat=ALL \
+                  -DskipTests \
+                  -DfailOnError=false \
+                  -Dnvd.api.key="${NVD_API_KEY}" \
+                  -DdataValidForHours=${DC_VALID_HOURS} \
+                  -DdataDirectory="${DC_CACHE_DIR}" \
+                  -DlogFile=target/dependency-check.log || true
+                cp -f target/dependency-check-report.* "${DC_REPORT_DIR}/" 2>/dev/null || true
+                cp -f target/dependency-check.log "${DC_REPORT_DIR}/" 2>/dev/null || true
+              '''
+            } else {
+              echo "[OWASP] Runner: Jenkins plugin CLI"
+              dependencyCheck(
+                odcInstallation: env.ODC_TOOL_NAME,
+                additionalArguments: """
+                  --project "${DC_PROJECT_NAME}"
+                  --scan "${WORKSPACE}"
+                  --out "${WORKSPACE}/${DC_REPORT_DIR}"
+                  -f ALL
+                  --nvdApiKey "${NVD_API_KEY}"
+                  --disableAssembly
+                  --failOnCVSS 11
+                  --data "${DC_CACHE_DIR}"
+                  --cveValidForHours ${DC_VALID_HOURS}
+                  --log "${WORKSPACE}/${DC_REPORT_DIR}/dependency-check.log"
+                """.trim(),
+                stopBuild: false
+              )
+            }
+
+            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+              dependencyCheckPublisher(
+                pattern: "${env.DC_REPORT_DIR}/dependency-check-report.xml",
+                stopBuild: false,
+                skipNoReportFiles: false
+              )
+            }
+
+            def jsonPath = "${env.DC_REPORT_DIR}/dependency-check-report.json"
+            if (!fileExists(jsonPath)) {
+              echo "[OWASP] JSON not found → skipping policy enforcement"
+              return
+            }
+            def report = readJSON file: jsonPath
+            def counts = [CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0]
+            def normSeverity = { val ->
+              if (val == null) return ''
+              if (val instanceof String) return val
+              if (val instanceof List && val) return val[0].toString()
+              if (val instanceof Map && val.level) return val.level.toString()
+              return val.toString()
+            }
+            (report.dependencies ?: []).each { d ->
+              (d.vulnerabilities ?: []).each { v ->
+                def s = normSeverity(v.severity).toUpperCase()
+                if (counts.containsKey(s)) counts[s] = counts[s] + 1
+              }
+            }
+            int failCrit = env.DC_FAIL_CRITICAL.toInteger()
+            int warnHigh = env.DC_UNSTABLE_HIGH.toInteger()
+            int warnMed  = env.DC_UNSTABLE_MEDIUM.toInteger()
+            echo "[OWASP] Counts: CRITICAL=${counts.CRITICAL}, HIGH=${counts.HIGH}, MEDIUM=${counts.MEDIUM}, LOW=${counts.LOW}"
+            echo "[OWASP] Thresholds: FAIL_CRITICAL>=${failCrit}, UNSTABLE_HIGH>=${warnHigh}, UNSTABLE_MEDIUM>=${warnMed}"
+            def owaspSummary = """OWASP Dependency-Check Summary for ${env.DC_PROJECT_NAME}
+Generated: ${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC'))}
+CRITICAL=${counts.CRITICAL}
+HIGH=${counts.HIGH}
+MEDIUM=${counts.MEDIUM}
+LOW=${counts.LOW}
+"""
+            writeFile file: "${env.DC_REPORT_DIR}/OWASP-Dependency-Check-Summary.txt", text: owaspSummary
+            archiveArtifacts artifacts: "${env.DC_REPORT_DIR}/dependency-check-report.html, ${env.DC_REPORT_DIR}/dependency-check-report.json, ${env.DC_REPORT_DIR}/dependency-check.log, ${env.DC_REPORT_DIR}/OWASP-Dependency-Check-Summary.txt", fingerprint: true, allowEmptyArchive: true
+            sh 'rm -f "${DC_REPORT_DIR}/dependency-check-report.sarif" || true'
+            if (counts.CRITICAL >= failCrit) {
+              error("[OWASP] FAIL: CRITICAL=${counts.CRITICAL} (>= ${failCrit})")
+            }
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+              if (counts.HIGH >= warnHigh || counts.MEDIUM >= warnMed) {
+                error("[OWASP] UNSTABLE: HIGH>=${warnHigh} or MEDIUM>=${warnMed}")
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ====== IaC / Checkov ======
+    stage('IaC Scan') {
+      steps {
+        sh '''
+          set -e
+          mkdir -p "${IAC_REPORT_DIR}" "${PIP_CACHE_DIR}" "$(dirname "${CHECKOV_VENV}")"
+          as_sudo() { if command -v sudo >/dev/null 2>&1; then sudo "$@"; else "$@"; fi; }
+          if ! command -v python3 >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              as_sudo apt-get update -y
+              as_sudo apt-get install -y python3 python3-venv python3-pip
+            elif command -v yum >/dev/null 2>&1; then
+              as_sudo yum install -y python3 python3-pip || as_sudo yum install -y python39 python39-pip
+            else
+              exit 1
+            fi
+          fi
+          if ! python3 -c "import venv" >/dev/null 2>&1; then
+            if (command -v apt-get >/dev/null 2>&1); then
+              as_sudo apt-get update -y
+              as_sudo apt-get install -y python3-venv
+            elif (command -v yum >/dev/null 2>&1); then
+              as_sudo yum install -y python3-virtualenv || true
+            fi
+          fi
+          if [ ! -f "${CHECKOV_VENV}/bin/activate" ]; then
+            python3 -m venv "${CHECKOV_VENV}" || {
+              if command -v apt-get >/dev/null 2>&1; then
+                as_sudo apt-get update -y
+                as_sudo apt-get install -y python3-venv python3-pip
+              elif command -v yum >/dev/null 2>&1; then
+                as_sudo yum install -y python3 python3-pip || true
+              fi
+              python3 -m venv "${CHECKOV_VENV}"
+            }
+          fi
+          . "${CHECKOV_VENV}/bin/activate"
+          pip install --upgrade pip
+          pip install --cache-dir "${PIP_CACHE_DIR}" -U "checkov==${CHECKOV_VERSION}"
+          checkov -d "$WORKSPACE" --framework "${CHECKOV_FRAMEWORKS}" --output json > "${IAC_REPORT_DIR}/checkov-report.json" || true
+          checkov -d "$WORKSPACE" --framework "${CHECKOV_FRAMEWORKS}" --output junitxml > "${IAC_REPORT_DIR}/checkov-report.xml" || true
+          deactivate || true
+          echo "Runner: pip (venv)" > "${IAC_REPORT_DIR}/runner.txt"
+        '''
+        catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+          junit allowEmptyResults: true, testResults: "${env.IAC_REPORT_DIR}/checkov-report.xml"
+        }
+        archiveArtifacts artifacts: "${env.IAC_REPORT_DIR}/checkov-report.json", fingerprint: true, allowEmptyArchive: true
+        sh 'rm -f "${IAC_REPORT_DIR}/checkov-report.xml" "${IAC_REPORT_DIR}/runner.txt" || true'
+
+        script {
+          def jsonPath = "${env.IAC_REPORT_DIR}/checkov-report.json"
+          if (!fileExists(jsonPath)) {
+            echo "[IaC] No report found → skipping policy"
+            return
+          }
+
+          def raw = readJSON file: jsonPath
+          def reports = (raw instanceof List) ? raw : [raw]
+
+          int totalFailed = 0
+          int totalPassed = 0
+          int totalSkipped = 0
+          int totalParsingErrors = 0
+
+          Map<String,Integer> byFramework = ['TERRAFORM':0, 'KUBERNETES':0, 'DOCKERFILE':0]
+
+          reports.each { rep ->
+            def sum = rep?.summary ?: [:]
+            int rFailed        = (sum.failed         ?: 0) as int
+            int rPassed        = (sum.passed         ?: 0) as int
+            int rSkipped       = (sum.skipped        ?: 0) as int
+            int rParsingErrors = (sum.parsing_errors ?: 0) as int
+
+            totalFailed        += rFailed
+            totalPassed        += rPassed
+            totalSkipped       += rSkipped
+            totalParsingErrors += rParsingErrors
+
+            def rType = (rep?.check_type ?: rep?.report_type ?: '').toString().toUpperCase()
+
+            if (rType.contains('TERRAFORM')) {
+              byFramework['TERRAFORM'] = byFramework['TERRAFORM'] + rFailed
+            } else if (rType.contains('KUBERNETES')) {
+              byFramework['KUBERNETES'] = byFramework['KUBERNETES'] + rFailed
+            } else if (rType.contains('DOCKERFILE')) {
+              byFramework['DOCKERFILE'] = byFramework['DOCKERFILE'] + rFailed
+            } else {
+              (rep?.results?.failed_checks ?: []).each { c ->
+                def ct = (c.check_type ?: '').toString().toUpperCase()
+                if (ct.contains('TERRAFORM'))      byFramework['TERRAFORM']  = byFramework['TERRAFORM']  + 1
+                else if (ct.contains('KUBERNETES'))byFramework['KUBERNETES'] = byFramework['KUBERNETES'] + 1
+                else if (ct.contains('DOCKERFILE'))byFramework['DOCKERFILE'] = byFramework['DOCKERFILE'] + 1
+              }
+            }
+          }
+
+          int tTotal = (env.IAC_UNSTABLE_TOTAL          ?: '0').toInteger()
+          int tTf    = (env.IAC_UNSTABLE_TERRAFORM      ?: '0').toInteger()
+          int tK8s   = (env.IAC_UNSTABLE_KUBERNETES     ?: '0').toInteger()
+          int tDock  = (env.IAC_UNSTABLE_DOCKERFILE     ?: '0').toInteger()
+          int tParse = (env.IAC_UNSTABLE_PARSING_ERRORS ?: '0').toInteger()
+
+          def hitTotal = (tTotal > 0 && totalFailed >= tTotal)
+          def hitTf    = (tTf    > 0 && byFramework['TERRAFORM']  >= tTf)
+          def hitK8s   = (tK8s   > 0 && byFramework['KUBERNETES'] >= tK8s)
+          def hitDock  = (tDock  > 0 && byFramework['DOCKERFILE'] >= tDock)
+          def hitParse = (tParse > 0 && totalParsingErrors >= tParse)
+
+          echo "[IaC] Totals: failed=${totalFailed}, passed=${totalPassed}, skipped=${totalSkipped}, parsing_errors=${totalParsingErrors}"
+          echo "[IaC] By framework: TERRAFORM=${byFramework['TERRAFORM']}, KUBERNETES=${byFramework['KUBERNETES']}, DOCKERFILE=${byFramework['DOCKERFILE']}"
+          echo "[IaC] Policy: total>=${tTotal}, terraform>=${tTf}, k8s>=${tK8s}, dockerfile>=${tDock}, parsing_errors>=${tParse}"
+
+          def iacSummary = """IaC (Checkov) Summary
+Generated: ${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC'))}
+FAILED=${totalFailed}
+PASSED=${totalPassed}
+SKIPPED=${totalSkipped}
+PARSING_ERRORS=${totalParsingErrors}
+TERRAFORM_FAILED=${byFramework['TERRAFORM']}
+KUBERNETES_FAILED=${byFramework['KUBERNETES']}
+DOCKERFILE_FAILED=${byFramework['DOCKERFILE']}
+Policy: total>=${tTotal}, terraform>=${tTf}, k8s>=${tK8s}, dockerfile>=${tDock}, parsing_errors>=${tParse}
+"""
+          writeFile file: "${env.IAC_REPORT_DIR}/IaC-Summary.txt", text: iacSummary
+          archiveArtifacts artifacts: "${env.IAC_REPORT_DIR}/IaC-Summary.txt, ${env.IAC_REPORT_DIR}/checkov-report.json", fingerprint: true, allowEmptyArchive: true
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            if (hitTotal || hitTf || hitK8s || hitDock || hitParse) {
+              error("[IaC] UNSTABLE: " +
+                (hitTotal ? "total_failed>=${tTotal}" : "") +
+                ((hitTotal && (hitTf||hitK8s||hitDock||hitParse)) ? " + " : "") +
+                (hitTf ? "terraform_failed>=${tTf}" : "") +
+                ((hitTf && (hitK8s||hitDock||hitParse)) ? " + " : "") +
+                (hitK8s ? "k8s_failed>=${tK8s}" : "") +
+                ((hitK8s && (hitDock||hitParse)) ? " + " : "") +
+                (hitDock ? "dockerfile_failed>=${tDock}" : "") +
+                ((hitDock && hitParse) ? " + " : "") +
+                (hitParse ? "parsing_errors>=${tParse}" : ""))
+            }
+          }
+        }
+      }
+    }
+
+    // ====== Trivy FS ======
+    stage('Trivy FS Scan') {
+  steps {
+    script {
+      sh '''#!/usr/bin/env bash
+set -e
+
+mkdir -p "${TRIVY_REPORT_DIR}"
+
+as_sudo() { if command -v sudo >/dev/null 2>&1; then sudo "$@"; else "$@"; fi; }
+
+# Install Trivy if missing (use current latest from installer)
+if ! command -v trivy >/dev/null 2>&1; then
+  curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+    | as_sudo sh -s -- -b /usr/local/bin
+fi
+
+# Run table (pretty) and JSON reports (NO --skip-version-check)
+trivy fs --scanners vuln,misconfig,secret --ignore-unfixed --no-progress \
+  --format table -o "${TRIVY_REPORT_DIR}/table.txt" .
+
+trivy fs --scanners vuln,misconfig,secret --ignore-unfixed --no-progress \
+  --format json -o "${TRIVY_REPORT_DIR}/trivy.json" .
+'''
+
+      archiveArtifacts artifacts: "${env.TRIVY_REPORT_DIR}/trivy.json", fingerprint: true, allowEmptyArchive: true
+
+      def jsonPath = "${env.TRIVY_REPORT_DIR}/trivy.json"
+      if (!fileExists(jsonPath)) {
+        echo "[TRIVY] No report found → skipping policy"
+        return
+      }
+
+      // ---- Parse JSON and count severities across vulns + misconfigs + secrets ----
+      def report = readJSON file: jsonPath
+      def sevKeys = ['CRITICAL','HIGH','MEDIUM','LOW']
+      def mkMap  = { sevKeys.collectEntries { [(it):0] } }
+
+      Map vulns = mkMap(); Map miscf = mkMap(); Map secs = mkMap()
+      def up = { Map m, String k -> k = (k ?: '').toUpperCase(); if (m.containsKey(k)) m[k] = (m[k] as int) + 1 }
+
+      (report?.Results ?: []).each { r ->
+        (r?.Vulnerabilities ?: []).each { v -> up(vulns, v?.Severity) }
+        (r?.Misconfigurations ?: []).each { m -> up(miscf, m?.Severity) }
+        (r?.Secrets ?: []).each { s ->
+          // Some secret findings might miss severity; treat missing as HIGH
+          def sev = (s?.Severity ? s?.Severity.toString().toUpperCase() : 'HIGH')
+          up(secs, sev)
+        }
+      }
+
+      Map total = mkMap()
+      sevKeys.each { k -> total[k] = (vulns[k] as int) + (miscf[k] as int) + (secs[k] as int) }
+
+      echo "[TRIVY] Vulnerabilities:   ${vulns}"
+      echo "[TRIVY] Misconfigurations: ${miscf}"
+      echo "[TRIVY] Secrets:           ${secs}"
+      echo "[TRIVY] TOTAL (V+M+S):     ${total}"
+
+      // ---- Build HTML (append pretty table with colors stripped) ----
+      writeFile file: "${env.TRIVY_REPORT_DIR}/trivy.html", text: """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trivy Filesystem Report</title></head><body>
+<h1>Trivy Filesystem Scan</h1>
+<div>CRITICAL: ${total.CRITICAL} • HIGH: ${total.HIGH} • MEDIUM: ${total.MEDIUM} • LOW: ${total.LOW} • Secrets: ${secs.CRITICAL + secs.HIGH + secs.MEDIUM + secs.LOW}</div>
+<h3>Breakdown</h3>
+<ul>
+  <li>Vulnerabilities — C:${vulns.CRITICAL} H:${vulns.HIGH} M:${vulns.MEDIUM} L:${vulns.LOW}</li>
+  <li>Misconfigurations — C:${miscf.CRITICAL} H:${miscf.HIGH} M:${miscf.MEDIUM} L:${miscf.LOW}</li>
+  <li>Secrets — C:${secs.CRITICAL} H:${secs.HIGH} M:${secs.MEDIUM} L:${secs.LOW}</li>
+</ul>
+<pre>
+""".stripIndent()
+
+      sh """
+        # strip ANSI colors and append table content
+        sed -e 's/\\x1b\\[[0-9;]*m//g' "${TRIVY_REPORT_DIR}/table.txt" >> "${TRIVY_REPORT_DIR}/trivy.html" || true
+        echo "</pre></body></html>" >> "${TRIVY_REPORT_DIR}/trivy.html"
+      """
+
+      archiveArtifacts artifacts: "${env.TRIVY_REPORT_DIR}/trivy.html", fingerprint: true, allowEmptyArchive: true
+
+      // ---- Thresholds + gating ----
+      def failCrit = env.TRIVY_FAIL_CRITICAL.toInteger()
+      def warnHigh = env.TRIVY_UNSTABLE_HIGH.toInteger()
+      def warnMed  = env.TRIVY_UNSTABLE_MEDIUM.toInteger()
+      echo "[TRIVY] Thresholds: FAIL_CRITICAL>=${failCrit}, UNSTABLE_HIGH>=${warnHigh}, UNSTABLE_MEDIUM>=${warnMed}"
+
+      def trivySummary = """Trivy FS Summary
+Generated: ${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC'))}
+CRITICAL=${total.CRITICAL}
+HIGH=${total.HIGH}
+MEDIUM=${total.MEDIUM}
+LOW=${total.LOW}
+(Secrets included in totals)
+Thresholds: FAIL_CRITICAL>=${failCrit}, UNSTABLE_HIGH>=${warnHigh}, UNSTABLE_MEDIUM>=${warnMed}
+"""
+      writeFile file: "${env.TRIVY_REPORT_DIR}/TRIVY-Summary.txt", text: trivySummary
+      archiveArtifacts artifacts: "${env.TRIVY_REPORT_DIR}/TRIVY-Summary.txt", fingerprint: true, allowEmptyArchive: true
+
+      // First: hard fail on CRITICAL threshold
+      if ((total.CRITICAL as int) >= failCrit) {
+        error("[TRIVY] FAIL: CRITICAL=${total.CRITICAL} (>= ${failCrit})")
+      }
+
+      // Then: mark UNSTABLE on HIGH/MEDIUM thresholds (pipeline continues)
+      catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+        if ((total.HIGH as int) >= warnHigh || (total.MEDIUM as int) >= warnMed) {
+          error("[TRIVY] UNSTABLE: HIGH>=${warnHigh} or MEDIUM>=${warnMed}")
+        }
+      }
+    }
+  }
+}
+
+
+
+
+
+
+  }
+
+  post {
+    success {
+      echo "[POST] Result=${currentBuild.currentResult}"
+      echo "[POST] OWASP: ${env.DC_REPORT_DIR}/  IaC: ${env.IAC_REPORT_DIR}/  Trivy: ${env.TRIVY_REPORT_DIR}/"
+    }
+    unstable {
+      echo "[POST] Result=${currentBuild.currentResult}"
+      echo "[POST] OWASP: ${env.DC_REPORT_DIR}/  IaC: ${env.IAC_REPORT_DIR}/  Trivy: ${env.TRIVY_REPORT_DIR}/"
+    }
+    cleanup {
+      // Extra safety: ensure app is not left running if Health Check failed mid-stage
+      sh '''
+        if [ -f app.pid ]; then
+          kill $(cat app.pid) >/dev/null 2>&1 || true
+          rm -f app.pid
+        fi
+      '''
+    }
+  }
+}
